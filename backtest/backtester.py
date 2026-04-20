@@ -92,7 +92,7 @@ class Backtester:
                 # 如果符合选股条件
                 if is_oversold and has_negative_j and has_golden_cross:
                     # 获取买入价格（回测日期收盘价）
-                    buy_price = df.iloc[test_date]['close']
+                    buy_price = df.iloc[test_idx]['close']
                     
                     # 获取卖出价格（holding_period天后的收盘价）
                     sell_date_idx = test_idx + self.holding_period

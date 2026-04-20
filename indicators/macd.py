@@ -36,7 +36,7 @@ class MACD:
         result = df.copy()
         
         # 获取收盘价
-        close = result['close']
+        close = result['close'].astype(float)
         
         # 计算EMA
         # EMA = 2/(N+1) * 收盘价 + (N-1)/(N+1) * 前一日EMA

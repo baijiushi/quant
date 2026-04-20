@@ -34,9 +34,9 @@ class KDJ:
         result = df.copy()
         
         # 获取最高价、最低价、收盘价
-        high = result['high']
-        low = result['low']
-        close = result['close']
+        high = result['high'].astype(float)
+        low = result['low'].astype(float)
+        close = result['close'].astype(float)
         
         # 计算N日内的最低价和最高价
         low_min = low.rolling(window=self.period, min_periods=1).min()
@@ -44,19 +44,17 @@ class KDJ:
         
         # 计算RSV (Raw Stochastic Value)
         # RSV = (收盘价 - N日最低价) / (N日最高价 - N日最低价) * 100
-        rsv = (close - low_min) / (high_max - low_min) * 100
-        # 处理除零情况
-        rsv = rsv.fillna(50)
+        rsv = pd.Series(50.0, index=result.index)  # 默认值50
+        mask = (high_max - low_min) != 0
+        rsv[mask] = (close[mask] - low_min[mask]) / (high_max[mask] - low_min[mask]) * 100
         
         # 计算K值: 当日K值 = 2/3 * 前一日K值 + 1/3 * 当日RSV
-        K = pd.Series(index=result.index, dtype=float)
-        K.iloc[0] = 50  # 第一个K值初始化为50
+        K = pd.Series(50.0, index=result.index)  # 第一个K值初始化为50
         for i in range(1, len(result)):
             K.iloc[i] = (2/3) * K.iloc[i-1] + (1/3) * rsv.iloc[i]
         
         # 计算D值: 当日D值 = 2/3 * 前一日D值 + 1/3 * 当日K值
-        D = pd.Series(index=result.index, dtype=float)
-        D.iloc[0] = 50  # 第一个D值初始化为50
+        D = pd.Series(50.0, index=result.index)  # 第一个D值初始化为50
         for i in range(1, len(result)):
             D.iloc[i] = (2/3) * D.iloc[i-1] + (1/3) * K.iloc[i]
         

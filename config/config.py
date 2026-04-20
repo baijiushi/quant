@@ -20,10 +20,11 @@ STRATEGY_CONFIG = {
     
     # 超跌条件
     "decline_period": 42,  # 跌幅计算周期（交易日，约2个月）
-    "decline_threshold": -0.20,  # 跌幅阈值（-20%）
+    "decline_threshold": -0.20,  # 跌幅阈值（-15%）
     
     # KDJ条件
     "j_negative": True,  # J值为负数
+    "j_threshold": 0,  # J值阈值，小于该值视为超卖
     
     # MACD条件
     "macd_golden_cross": True,  # MACD金叉

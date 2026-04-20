@@ -60,6 +60,7 @@ class OversoldBuyStrategy:
         # 策略参数
         self.decline_period = config.get("decline_period", 42)
         self.decline_threshold = config.get("decline_threshold", -0.20)
+        self.j_threshold = config.get("j_threshold", 10)
     
     def calculate_decline(self, df):
         """
@@ -112,7 +113,7 @@ class OversoldBuyStrategy:
             return False
         
         latest_j = df['J'].iloc[-1]
-        return latest_j < 0
+        return latest_j < self.j_threshold
     
     def has_macd_golden_cross(self, df, window=5):
         """
@@ -234,7 +235,7 @@ class OversoldBuyStrategy:
         report.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         report.append("=" * 80)
         report.append(f"\n选股条件:")
-        report.append(f"  1. KDJ指标J值为负数")
+        report.append(f"  1. KDJ指标J值小于 {self.j_threshold}")
         report.append(f"  2. MACD金叉或即将金叉")
         report.append(f"  3. 前2个月跌幅超过{abs(self.decline_threshold * 100):.0f}%")
         report.append(f"\n共选出 {len(selected_stocks)} 只股票:")
