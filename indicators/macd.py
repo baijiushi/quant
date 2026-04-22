@@ -65,44 +65,31 @@ class MACD:
     @staticmethod
     def check_golden_cross(df, window=5):
         """
-        检查MACD金叉
-        
-        金叉定义：DIF从下方上穿DEA
+        检查MACD金叉（严格模式：DIF在近N日内真实上穿DEA）
+
+        金叉定义：DIF从下方上穿DEA（前一日 DIF < DEA，当日 DIF >= DEA）
         
         Args:
             df: DataFrame，需包含'DIF', 'DEA'列
             window: 检查窗口期，默认5天
             
         Returns:
-            bool: 是否出现金叉或即将金叉
+            bool: 近window日内是否出现真实金叉
         """
         if df.empty or 'DIF' not in df.columns or 'DEA' not in df.columns:
             return False
         
-        # 获取最近window天的数据
-        recent_data = df.tail(window)
+        recent_data = df.tail(window + 1)  # 多取一行以便判断前一日
         
         if len(recent_data) < 2:
             return False
         
-        DIF = recent_data['DIF']
-        DEA = recent_data['DEA']
+        DIF = recent_data['DIF'].values
+        DEA = recent_data['DEA'].values
         
-        # 检查是否已经金叉
+        # 严格金叉：前一日 DIF < DEA，当日 DIF >= DEA
         for i in range(1, len(recent_data)):
-            # 前一天DIF <= DEA，当天DIF > DEA
-            if DIF.iloc[i-1] <= DEA.iloc[i-1] and DIF.iloc[i] > DEA.iloc[i]:
-                return True
-        
-        # 检查是否即将金叉（DIF和DEA差值很小且DIF在上升）
-        if len(recent_data) >= 2:
-            diff = DIF - DEA
-            latest_diff = diff.iloc[-1]
-            prev_diff = diff.iloc[-2]
-            
-            # 条件：差值小于0但在缩小，或者差值很小且DIF在上升
-            if (latest_diff < 0 and latest_diff > prev_diff) or \
-               (abs(latest_diff) < 0.1 and DIF.iloc[-1] > DIF.iloc[-2]):
+            if DIF[i - 1] < DEA[i - 1] and DIF[i] >= DEA[i]:
                 return True
         
         return False

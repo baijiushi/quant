@@ -1,0 +1,8 @@
+# dashboard.yaml — 看盘界面配置
+
+dashboard:
+  title: "量化选股 · B1策略看盘"
+  candidates_file: "./data/candidates/candidates_latest.json"
+  cache_dir: "./data/cache"
+  adjust: "qfq"
+  chart_days: 120     # K 线图展示最近 N 个交易日

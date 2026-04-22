@@ -24,7 +24,7 @@ STRATEGY_CONFIG = {
     
     # KDJ条件
     "j_negative": True,  # J值为负数
-    "j_threshold": 0,  # J值阈值，小于该值视为超卖
+    "j_threshold": 20,  # J值阈值，小于该值视为超卖
     
     # MACD条件
     "macd_golden_cross": True,  # MACD金叉

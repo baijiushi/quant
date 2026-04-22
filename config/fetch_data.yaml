@@ -1,0 +1,9 @@
+# fetch_data.yaml — 数据拉取配置
+
+data:
+  adjust: "qfq"          # 复权类型：qfq 前复权 / hfq 后复权 / "" 不复权
+  history_days: 300      # 拉取最近 N 天历史数据（足够计算所有均线和 KDJ）
+  cache_dir: "./data/cache"
+
+stock_list:
+  cache_file: "./data/cache/stock_list.csv"

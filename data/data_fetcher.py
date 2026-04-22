@@ -41,9 +41,9 @@ class AStockDataFetcher:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.stock_list_cache_file = self.cache_dir / "stock_list.csv"
 
-    def _history_cache_file(self, symbol, start_date, end_date, adjust):
-        """生成历史数据缓存文件路径"""
-        filename = f"{symbol}_{start_date}_{end_date}_{adjust or 'bfq'}.csv"
+    def _history_cache_file(self, symbol, adjust):
+        """生成历史数据缓存文件路径（按股票代码+复权类型命名，不含日期范围）"""
+        filename = f"{symbol}_{adjust or 'bfq'}.csv"
         return self.cache_dir / filename
 
     def _load_stock_list_cache(self):
@@ -66,25 +66,25 @@ class AStockDataFetcher:
         except Exception as e:
             logger.warning(f"保存股票列表缓存失败: {e}")
 
-    def _load_history_cache(self, symbol, start_date, end_date, adjust):
-        """读取历史数据缓存"""
-        cache_file = self._history_cache_file(symbol, start_date, end_date, adjust)
+    def _load_full_history_cache(self, symbol, adjust):
+        """读取股票完整历史数据缓存（含全部已缓存日期）"""
+        cache_file = self._history_cache_file(symbol, adjust)
         if cache_file.exists():
             try:
                 df = pd.read_csv(cache_file)
                 df = self._normalize_history_dataframe(df)
                 if not df.empty:
-                    logger.info(f"从本地缓存读取股票{symbol}历史数据成功，共{len(df)}条")
+                    logger.debug(f"从本地缓存读取股票{symbol}完整历史数据，共{len(df)}条")
                     return df
             except Exception as e:
                 logger.warning(f"读取股票{symbol}历史数据缓存失败: {e}")
         return pd.DataFrame()
 
-    def _save_history_cache(self, symbol, start_date, end_date, adjust, df):
-        """保存历史数据缓存"""
+    def _save_full_history_cache(self, symbol, adjust, df):
+        """保存股票完整历史数据缓存"""
         try:
             if df is not None and not df.empty:
-                cache_file = self._history_cache_file(symbol, start_date, end_date, adjust)
+                cache_file = self._history_cache_file(symbol, adjust)
                 df.reset_index().to_csv(cache_file, index=False, encoding='utf-8-sig')
         except Exception as e:
             logger.warning(f"保存股票{symbol}历史数据缓存失败: {e}")
@@ -225,91 +225,135 @@ class AStockDataFetcher:
             logger.error(f"获取股票列表失败: {e}")
             return pd.DataFrame()
     
-    def get_stock_history(self, symbol, start_date=None, end_date=None, adjust="qfq"):
+    def _fetch_history_from_api(self, symbol, start_date, end_date, adjust="qfq"):
         """
-        获取单只股票的历史数据
+        通过 API 接口获取股票历史数据（不含缓存逻辑）
+
+        Returns:
+            pandas.DataFrame: 获取到的历史数据，失败时返回空 DataFrame
+        """
+        # 方法1: 腾讯接口
+        try:
+            tx_symbol = f"sh{symbol}" if symbol.startswith('6') else f"sz{symbol}"
+            df = ak.stock_zh_a_hist_tx(
+                symbol=tx_symbol,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            df = self._normalize_history_dataframe(df)
+            if not df.empty:
+                logger.info(f"腾讯接口成功获取股票{symbol}的{len(df)}条历史数据")
+                return df
+        except Exception as e1:
+            logger.warning(f"腾讯接口获取股票{symbol}历史数据失败: {e1}")
+
+        # 方法2: 新浪日线接口（全量数据，按日期截取）
+        try:
+            sina_symbol = f"sh{symbol}" if symbol.startswith('6') else f"sz{symbol}"
+            df = ak.stock_zh_a_daily(symbol=sina_symbol, adjust=adjust)
+            df = self._normalize_history_dataframe(df)
+            if not df.empty:
+                start_dt = pd.to_datetime(start_date)
+                end_dt = pd.to_datetime(end_date)
+                df = df[(df.index >= start_dt) & (df.index <= end_dt)]
+                if not df.empty:
+                    logger.info(f"新浪接口成功获取股票{symbol}的{len(df)}条历史数据")
+                    return df
+        except Exception as e2:
+            logger.warning(f"新浪接口获取股票{symbol}历史数据失败: {e2}")
+
+        # 方法3: 东财接口（默认关闭）
+        if self.enable_eastmoney_fallback:
+            try:
+                df = ak.stock_zh_a_hist(
+                    symbol=symbol,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust=adjust
+                )
+                df = self._normalize_history_dataframe(df)
+                if not df.empty:
+                    logger.info(f"东财接口成功获取股票{symbol}的{len(df)}条历史数据")
+                    return df
+            except Exception as e3:
+                logger.debug(f"东财接口获取股票{symbol}历史数据失败: {e3}")
+
+        logger.warning(f"股票{symbol}所有接口均未获取到历史数据")
+        return pd.DataFrame()
+
+    def get_stock_history(self, symbol, start_date=None, end_date=None, adjust="qfq", use_cache_only=False):
+        """
+        获取单只股票的历史数据（支持增量缓存）
         
         Args:
             symbol: 股票代码，如"000001"
             start_date: 开始日期，格式"YYYYMMDD"，默认为6个月前
             end_date: 结束日期，格式"YYYYMMDD"，默认为今天
             adjust: 复权类型，"qfq"前复权，"hfq"后复权，""不复权
+            use_cache_only: 为 True 时仅使用本地缓存，不调用任何接口
             
         Returns:
             pandas.DataFrame: 股票历史数据
         """
-        # 设置默认日期
         if end_date is None:
             end_date = datetime.now().strftime("%Y%m%d")
         if start_date is None:
             start_date = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
-            
+
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+
         try:
-            logger.info(f"正在获取股票{symbol}的历史数据...")
+            # 加载本地完整缓存
+            existing_df = self._load_full_history_cache(symbol, adjust)
 
-            # 优先读取本地缓存
-            cached_df = self._load_history_cache(symbol, start_date, end_date, adjust)
-            if not cached_df.empty:
-                return cached_df
+            if not existing_df.empty:
+                cached_max_date = existing_df.index.max()
 
-            # 方法1: 腾讯接口（AkShare，绕开东财历史K线接口）
-            try:
-                tx_symbol = f"sh{symbol}" if symbol.startswith('6') else f"sz{symbol}"
-                df = ak.stock_zh_a_hist_tx(
-                    symbol=tx_symbol,
-                    start_date=start_date,
-                    end_date=end_date,
-                )
-                df = self._normalize_history_dataframe(df)
-                if not df.empty:
-                    logger.info(f"腾讯接口成功获取股票{symbol}的{len(df)}条历史数据")
-                    self._save_history_cache(symbol, start_date, end_date, adjust, df)
-                    return df
-            except Exception as e1:
-                logger.warning(f"腾讯接口获取股票{symbol}历史数据失败: {e1}")
+                # 缓存已覆盖所请求的结束日期（允许 1 天误差，防止非交易日问题）
+                if cached_max_date >= end_dt - timedelta(days=1):
+                    result = existing_df[(existing_df.index >= start_dt) & (existing_df.index <= end_dt)]
+                    logger.info(f"命中本地缓存：股票{symbol}，共{len(result)}条")
+                    return result
 
-            # 方法2: 新浪日线接口（AkShare，全量数据，再按日期截取）
-            try:
-                sina_symbol = f"sh{symbol}" if symbol.startswith('6') else f"sz{symbol}"
-                df = ak.stock_zh_a_daily(symbol=sina_symbol, adjust=adjust)
-                df = self._normalize_history_dataframe(df)
-                if not df.empty:
-                    start_dt = pd.to_datetime(start_date)
-                    end_dt = pd.to_datetime(end_date)
-                    df = df[(df.index >= start_dt) & (df.index <= end_dt)]
-                    if not df.empty:
-                        logger.info(f"新浪接口成功获取股票{symbol}的{len(df)}条历史数据")
-                        self._save_history_cache(symbol, start_date, end_date, adjust, df)
-                        return df
-            except Exception as e2:
-                logger.warning(f"新浪接口获取股票{symbol}历史数据失败: {e2}")
+                if use_cache_only:
+                    result = existing_df[(existing_df.index >= start_dt) & (existing_df.index <= end_dt)]
+                    logger.info(f"仅使用本地缓存（不更新）：股票{symbol}，共{len(result)}条")
+                    return result
 
-            # 方法3: 东财接口（默认关闭，仅在需要时手动开启）
-            if self.enable_eastmoney_fallback:
-                try:
-                    df = ak.stock_zh_a_hist(
-                        symbol=symbol,
-                        period="daily",
-                        start_date=start_date,
-                        end_date=end_date,
-                        adjust=adjust
-                    )
-                    df = self._normalize_history_dataframe(df)
-                    if not df.empty:
-                        logger.info(f"东财接口成功获取股票{symbol}的{len(df)}条历史数据")
-                        self._save_history_cache(symbol, start_date, end_date, adjust, df)
-                        return df
-                except Exception as e3:
-                    logger.debug(f"东财接口获取股票{symbol}历史数据失败: {e3}")
+                # 增量获取：只拉取本地最新日期之后的数据
+                fetch_start = (cached_max_date + timedelta(days=1)).strftime("%Y%m%d")
+                logger.info(f"增量获取股票{symbol}：{fetch_start} ~ {end_date}")
+                new_df = self._fetch_history_from_api(symbol, fetch_start, end_date, adjust)
 
-            logger.warning(f"股票{symbol}未获取到历史数据")
-            return pd.DataFrame()
-                
+                if not new_df.empty:
+                    merged = pd.concat([existing_df, new_df])
+                    merged = merged[~merged.index.duplicated(keep='last')].sort_index()
+                    self._save_full_history_cache(symbol, adjust, merged)
+                    return merged[(merged.index >= start_dt) & (merged.index <= end_dt)]
+                else:
+                    # 增量获取失败，返回已有缓存数据
+                    logger.warning(f"增量获取{symbol}失败，使用已有缓存")
+                    return existing_df[(existing_df.index >= start_dt) & (existing_df.index <= end_dt)]
+
+            # 无缓存且仅使用本地模式
+            if use_cache_only:
+                logger.warning(f"股票{symbol}无本地缓存且已禁用网络获取")
+                return pd.DataFrame()
+
+            # 无缓存，全量获取
+            logger.info(f"全量获取股票{symbol}：{start_date} ~ {end_date}")
+            new_df = self._fetch_history_from_api(symbol, start_date, end_date, adjust)
+            if not new_df.empty:
+                self._save_full_history_cache(symbol, adjust, new_df)
+            return new_df
+
         except Exception as e:
             logger.error(f"获取股票{symbol}历史数据失败: {e}")
             return pd.DataFrame()
-    
-    def get_multiple_stocks_history(self, symbols, start_date=None, end_date=None, adjust="qfq"):
+
+    def get_multiple_stocks_history(self, symbols, start_date=None, end_date=None, adjust="qfq", use_cache_only=False):
         """
         批量获取多只股票的历史数据（并行版本）
         
@@ -318,6 +362,7 @@ class AStockDataFetcher:
             start_date: 开始日期
             end_date: 结束日期
             adjust: 复权类型
+            use_cache_only: 为 True 时仅使用本地缓存，不调用任何接口
             
         Returns:
             dict: 以股票代码为键，DataFrame为值的字典
@@ -328,7 +373,7 @@ class AStockDataFetcher:
         def fetch_single(symbol):
             """获取单只股票数据的辅助函数"""
             try:
-                df = self.get_stock_history(symbol, start_date, end_date, adjust)
+                df = self.get_stock_history(symbol, start_date, end_date, adjust, use_cache_only=use_cache_only)
                 if not df.empty:
                     return symbol, df
                 return symbol, pd.DataFrame()

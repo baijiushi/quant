@@ -110,17 +110,46 @@ def main():
         test_symbols = symbols[:100]
         logger.info(f"默认使用测试模式，将分析{len(test_symbols)}只股票")
     
+    # 选择数据获取方式
+    print("\n请选择数据获取方式:")
+    print("  1. 仅使用本地缓存（不调用接口，速度最快）")
+    print("  2. 增量更新（仅获取本地缺失的最新数据，推荐）")
+    print("  3. 强制全量刷新（忽略缓存，重新获取所有数据）")
+    try:
+        data_choice = input("\n请输入选择 (1/2/3，默认为2): ").strip()
+    except Exception:
+        data_choice = "2"
+
+    use_cache_only = (data_choice == "1")
+    force_refresh = (data_choice == "3")
+
     # 获取历史数据
     logger.info("正在获取股票历史数据，请稍候...")
-    
+
     # 计算日期范围（获取足够的历史数据用于计算2个月跌幅）
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - pd.Timedelta(days=180)).strftime("%Y%m%d")
-    
+
+    if force_refresh:
+        # 强制刷新：删除对应缓存文件后再获取
+        import glob
+        cache_dir = os.path.join("data", "cache")
+        deleted = 0
+        for sym in test_symbols:
+            for f in glob.glob(os.path.join(cache_dir, f"{sym}_qfq.csv")):
+                try:
+                    os.remove(f)
+                    deleted += 1
+                except Exception:
+                    pass
+        if deleted:
+            logger.info(f"已清除 {deleted} 个本地缓存文件，将重新获取数据")
+
     stock_data = data_fetcher.get_multiple_stocks_history(
         symbols=test_symbols,
         start_date=start_date,
-        end_date=end_date
+        end_date=end_date,
+        use_cache_only=use_cache_only
     )
     
     logger.info(f"成功获取{len(stock_data)}只股票的历史数据")
