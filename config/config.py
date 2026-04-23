@@ -5,6 +5,14 @@ DATA_CONFIG = {
     "market": "A股",  # 市场类型
     "start_date": "20240101",  # 默认开始日期
     "end_date": "20260419",  # 默认结束日期
+    "provider": "tushare",  # 数据源
+    "data_root": "data",  # 数据根目录
+    "history_dir": "data/raw",  # 个股历史 CSV 目录
+    "stock_list_file": "data/stocklist.csv",  # 股票列表 CSV
+    "rate_limit_per_minute": 180,  # TUShare 限频保护值，留出余量避免撞上上限
+    "request_interval_seconds": 0.35,  # 单次请求间隔
+    "max_retries": 3,  # 请求失败重试次数
+    "max_workers": 3,  # 顺序/低并发抓取，避免频率过快
 }
 
 # 选股策略参数

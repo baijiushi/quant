@@ -12,7 +12,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from config.config import STRATEGY_CONFIG, OUTPUT_CONFIG
+from config.config import DATA_CONFIG, STRATEGY_CONFIG, OUTPUT_CONFIG
 from data.data_fetcher import AStockDataFetcher
 from strategy.oversold_buy import OversoldBuyStrategy
 
@@ -131,19 +131,13 @@ def main():
     start_date = (datetime.now() - pd.Timedelta(days=180)).strftime("%Y%m%d")
 
     if force_refresh:
-        # 强制刷新：删除对应缓存文件后再获取
-        import glob
-        cache_dir = os.path.join("data", "cache")
-        deleted = 0
-        for sym in test_symbols:
-            for f in glob.glob(os.path.join(cache_dir, f"{sym}_qfq.csv")):
-                try:
-                    os.remove(f)
-                    deleted += 1
-                except Exception:
-                    pass
+        # 强制刷新：删除对应 TUShare CSV 缓存后再获取
+        deleted = data_fetcher.clear_history_cache(
+            test_symbols,
+            adjust=DATA_CONFIG.get("adjust", "qfq"),
+        )
         if deleted:
-            logger.info(f"已清除 {deleted} 个本地缓存文件，将重新获取数据")
+            logger.info(f"已清除 {deleted} 个本地 CSV 缓存文件，将重新获取数据")
 
     stock_data = data_fetcher.get_multiple_stocks_history(
         symbols=test_symbols,

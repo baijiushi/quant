@@ -48,20 +48,43 @@ output/                # 输出目录（自动创建）
 
 ## 依赖包
 
-akshare>=1.10.0
-pandas>=1.3.0
-numpy>=1.20.0
+tushare>=1.4.25
+pandas>=1.5.0
+numpy>=1.23.0
 
 ## 安装和运行
 
 1. 安装依赖：
 pip install -r requirements.txt
 
-2. 运行选股程序：
+2. 配置 TUShare Token：
+
+优先推荐在项目根目录的 `.env.local` 中填写：
+`TUSHARE_TOKEN=你的token`
+
+如果你更想用系统环境变量，也可以在 Windows PowerShell 中执行：
+`setx TUSHARE_TOKEN "你的token"`
+
+3. 运行选股程序：
 python main.py
 
-3. 运行回测程序：
+4. 运行回测程序：
 python backtest_main.py
+
+## 数据存储位置
+
+- 股票列表：`data/stocklist.csv`
+- 个股历史数据：`data/raw/<股票代码>_qfq.csv`
+- 选股候选：`data/candidates/`
+- 输出结果：`output/`
+
+当前项目已改为使用 **TUShare** 获取股票列表和历史日线数据，并按单股票 CSV 文件保存，便于直接查看和管理。
+
+## 项目规划
+
+后续任务路线整理在：
+
+- [`项目任务表.md`](E:\百九十\Desktop\量化选股策略\oversell\项目任务表.md)
 
 ## 风险提示
 
