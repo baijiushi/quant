@@ -31,6 +31,11 @@ sys.path.insert(0, str(_ROOT / "pipeline"))
 _DEFAULT_CONFIG = _ROOT / "config" / "dashboard.yaml"
 
 
+def _resolve_project_path(path_like: str) -> Path:
+    path = Path(path_like)
+    return path if path.is_absolute() else (_ROOT / path)
+
+
 @st.cache_data(ttl=60)
 def _load_dashboard_config() -> dict:
     if _DEFAULT_CONFIG.exists():
@@ -50,7 +55,7 @@ def _cfg(key: str, default):
 
 @st.cache_data(ttl=30)
 def load_candidates() -> dict | None:
-    candidates_file = Path(_cfg("candidates_file", "./data/candidates/candidates_latest.json"))
+    candidates_file = _resolve_project_path(_cfg("candidates_file", "data/candidates/candidates_latest.json"))
     if not candidates_file.exists():
         return None
     with open(candidates_file, encoding="utf-8") as f:
@@ -61,8 +66,8 @@ def load_candidates() -> dict | None:
 def load_kline(code: str) -> pd.DataFrame:
     """从缓存目录读取股票 K 线数据。"""
     adjust    = _cfg("adjust", "qfq")
-    cache_dir = Path(_cfg("cache_dir", "./data/cache"))
-    fpath     = cache_dir / f"{code}_{adjust}.csv"
+    data_dir  = _resolve_project_path(_cfg("data_dir", "data/raw"))
+    fpath     = data_dir / f"{code}_{adjust}.csv"
 
     if not fpath.exists():
         return pd.DataFrame()

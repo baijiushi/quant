@@ -3,7 +3,7 @@ pipeline/pipeline_core.py
 数据加载与基础设施层
 
 提供：
-  - load_cache_data()         从 data/cache/ 批量加载并规范化 CSV
+  - load_price_data()         从 data/raw/ 批量加载并规范化 CSV
   - build_top_turnover_pool() 按滚动成交额筛选流动性池
 """
 from __future__ import annotations
@@ -97,19 +97,19 @@ def _load_one_csv(item: Tuple[str, Path], n_turnover_days: int) -> Tuple[str, pd
 # 公开 API
 # =============================================================================
 
-def load_cache_data(
-    cache_dir: str,
+def load_price_data(
+    data_dir: str,
     adjust: str = "qfq",
     symbols: Optional[List[str]] = None,
     n_turnover_days: int = 43,
     max_workers: int = 8,
 ) -> Dict[str, pd.DataFrame]:
     """
-    从缓存目录批量加载股票数据（{code}_{adjust}.csv），
+    从日线目录批量加载股票数据（{code}_{adjust}.csv），
     规范化列名并计算 turnover_n（滚动成交额）。
 
     Args:
-        cache_dir:       缓存目录路径
+        data_dir:        日线目录路径
         adjust:          复权类型，与文件名后缀对应
         symbols:         仅加载指定代码，None 表示全量
         n_turnover_days: 滚动成交额窗口
@@ -118,18 +118,18 @@ def load_cache_data(
     Returns:
         dict[code → DataFrame]，DataFrame 以 DatetimeIndex 排序
     """
-    cache_path = Path(cache_dir)
-    if not cache_path.exists():
-        raise FileNotFoundError(f"缓存目录不存在: {cache_dir}")
+    data_path = Path(data_dir)
+    if not data_path.exists():
+        raise FileNotFoundError(f"日线目录不存在: {data_dir}")
 
     files: Dict[str, Path] = {}
-    for f in cache_path.glob(f"*_{adjust}.csv"):
+    for f in data_path.glob(f"*_{adjust}.csv"):
         code = f.stem[: -(len(adjust) + 1)]  # 去掉 _{adjust} 后缀
         if symbols is None or code in symbols:
             files[code] = f
 
     if not files:
-        logger.warning("在 %s 中未找到 *_%s.csv 文件", cache_dir, adjust)
+        logger.warning("在 %s 中未找到 *_%s.csv 文件", data_dir, adjust)
         return {}
 
     logger.info("发现 %d 只股票缓存文件，开始并发加载...", len(files))

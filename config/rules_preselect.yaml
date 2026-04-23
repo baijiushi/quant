@@ -2,8 +2,9 @@
 
 # ── 全局设置 ─────────────────────────────────────────────────────────────────
 global:
-  data_dir: "./data/cache"        # 日线 CSV 缓存目录
-  output_dir: "./data/candidates" # 候选结果输出目录
+  data_dir: "data/raw"            # 日线 CSV 数据目录
+  stock_list_file: "data/stocklist.csv"
+  output_dir: "data/candidates"   # 候选结果输出目录
   adjust: "qfq"                   # 复权类型
   top_m: 3000                     # 流动性池：取成交额最高的 top_m 只（0 = 不过滤）
   n_turnover_days: 43             # 滚动成交额计算窗口（日）
@@ -16,7 +17,7 @@ b1:
   kdj_period: 9          # KDJ 计算周期
 
   # 超卖判断：J 值低于此阈值视为超卖
-  j_threshold: 15.0
+  j_threshold: 30.0
 
   # 知行均线周期（日线 SMA）
   zx_m1: 14

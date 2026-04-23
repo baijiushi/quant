@@ -77,11 +77,40 @@ def _print_summary() -> None:
     print(header)
     print("-" * len(header))
     for i, c in enumerate(candidates, 1):
-        zx  = "✅" if c.get("zx_aligned")     else "❌"
-        wma = "✅" if c.get("weekly_aligned")  else "❌"
+        zx  = "Y" if c.get("zx_aligned")     else "N"
+        wma = "Y" if c.get("weekly_aligned")  else "N"
         print(f"{i:>4}  {c['code']:>8}  {c.get('name', c['code']):>8}  "
               f"{c.get('close', 0):>8.2f}  {c.get('J', 0):>6.1f}  "
               f"{zx:>6}  {wma:>6}")
+
+
+def _choose_data_mode(args: argparse.Namespace) -> str:
+    """确定本次运行的数据模式。"""
+    if getattr(args, "data_mode", None):
+        return args.data_mode
+    if args.skip_fetch:
+        return "existing"
+    if args.use_cache_only:
+        return "cache-only"
+
+    print(f"\n{'=' * 60}")
+    print("[数据模式] 请选择本次运行方式")
+    print("  1. 直接使用当前本地数据（不拉新数据）")
+    print("  2. 增量更新后再运行（推荐）")
+    print("  3. 强制重新拉取全部数据")
+    print("  4. 仅使用本地缓存文件运行 fetch（不走网络）")
+    print(f"{'=' * 60}")
+    try:
+        choice = input("请输入选择 (1/2/3/4，默认为2): ").strip()
+    except Exception:
+        choice = "2"
+
+    return {
+        "1": "existing",
+        "2": "incremental",
+        "3": "refresh",
+        "4": "cache-only",
+    }.get(choice, "incremental")
 
 
 # =============================================================================
@@ -113,17 +142,26 @@ def main() -> None:
         "--use-cache-only", action="store_true",
         help="数据拉取时仅使用本地缓存，不调用网络接口",
     )
+    parser.add_argument(
+        "--data-mode",
+        choices=["existing", "incremental", "refresh", "cache-only"],
+        default=None,
+        help="数据模式：existing=直接用现有数据，incremental=增量更新，refresh=强制重拉，cache-only=仅用本地缓存",
+    )
     args = parser.parse_args()
 
+    data_mode = _choose_data_mode(args)
     start = args.start_from
-    if args.skip_fetch and start == 1:
+    if data_mode == "existing" and start == 1:
         start = 2
 
     # ── 步骤 1：拉取 / 更新数据 ───────────────────────────────────────────────
     if start <= 1:
         fetch_cmd = [PYTHON, "pipeline/fetch_data.py"]
-        if args.use_cache_only:
+        if data_mode == "cache-only":
             fetch_cmd.append("--use-cache-only")
+        elif data_mode == "refresh":
+            fetch_cmd.append("--force-refresh")
         _run("步骤 1 / 3  拉取 K 线数据", fetch_cmd)
 
     # ── 步骤 2：量化初选 ──────────────────────────────────────────────────────

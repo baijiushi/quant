@@ -12,6 +12,12 @@ from pathlib import Path
 from pipeline.schemas import CandidateRun
 
 logger = logging.getLogger(__name__)
+_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _resolve_project_path(path_like: str | Path) -> Path:
+    path = Path(path_like)
+    return path if path.is_absolute() else (_ROOT / path)
 
 
 def save_candidates(run: CandidateRun, output_dir: str) -> Path:
@@ -23,7 +29,7 @@ def save_candidates(run: CandidateRun, output_dir: str) -> Path:
     Returns:
         Path: 带日期的文件路径
     """
-    out = Path(output_dir)
+    out = _resolve_project_path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     payload = json.dumps(run.to_dict(), ensure_ascii=False, indent=2, default=str)
@@ -40,7 +46,7 @@ def save_candidates(run: CandidateRun, output_dir: str) -> Path:
 
 def load_candidates(json_file: str) -> CandidateRun:
     """从 JSON 文件加载 CandidateRun。"""
-    p = Path(json_file)
+    p = _resolve_project_path(json_file)
     if not p.exists():
         raise FileNotFoundError(f"找不到候选文件: {json_file}")
     with open(p, encoding="utf-8") as f:

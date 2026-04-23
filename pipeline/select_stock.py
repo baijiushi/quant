@@ -4,7 +4,7 @@ pipeline/select_stock.py
 
 职责：
   1. 读取 rules_preselect.yaml 参数
-  2. 通过 pipeline_core 加载本地缓存数据
+  2. 通过 pipeline_core 加载本地日线数据
   3. 流动性过滤（top_m 只）
   4. 运行 B1Selector，收集 Candidate
   5. 通过 io.save_candidates() 写入结果 JSON
@@ -37,7 +37,7 @@ sys.path.insert(0, str(_ROOT / "pipeline"))
 
 from pipeline.schemas import Candidate, CandidateRun       # noqa: E402
 from pipeline.Selector import B1Selector                    # noqa: E402
-from pipeline.pipeline_core import load_cache_data, build_top_turnover_pool  # noqa: E402
+from pipeline.pipeline_core import load_price_data, build_top_turnover_pool  # noqa: E402
 from pipeline.io import save_candidates                     # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,8 @@ _DEFAULT_CONFIG = _ROOT / "config" / "rules_preselect.yaml"
 
 def load_config(config_path: Optional[str] = None) -> dict:
     path = Path(config_path) if config_path else _DEFAULT_CONFIG
+    if not path.is_absolute():
+        path = _ROOT / path
     if not path.exists():
         raise FileNotFoundError(f"找不到配置文件: {path}")
     with open(path, encoding="utf-8") as f:
@@ -61,9 +63,14 @@ def load_config(config_path: Optional[str] = None) -> dict:
 # 辅助函数
 # =============================================================================
 
-def _load_stock_names(cache_dir: str) -> Dict[str, str]:
+def _resolve_project_path(path_like: str) -> Path:
+    path = Path(path_like)
+    return path if path.is_absolute() else (_ROOT / path)
+
+
+def _load_stock_names(stock_list_file: str) -> Dict[str, str]:
     """加载股票名称映射（代码 → 名称）。"""
-    name_file = Path(cache_dir) / "stock_list.csv"
+    name_file = _resolve_project_path(stock_list_file)
     if not name_file.exists():
         return {}
     try:
@@ -131,15 +138,16 @@ def run(
         logger.info("B1 策略已禁用（b1.enabled = false）")
         return CandidateRun(run_date=datetime.now().strftime("%Y-%m-%d"), pick_date="")
 
-    data_dir       = g_cfg.get("data_dir",       "./data/cache")
-    out_dir        = output_dir or g_cfg.get("output_dir", "./data/candidates")
+    data_dir       = _resolve_project_path(g_cfg.get("data_dir", "data/raw"))
+    out_dir        = _resolve_project_path(output_dir or g_cfg.get("output_dir", "data/candidates"))
+    stock_list_file = g_cfg.get("stock_list_file", "data/stocklist.csv")
     adjust         = g_cfg.get("adjust",          "qfq")
     top_m          = int(g_cfg.get("top_m",        3000))
     n_turn_days    = int(g_cfg.get("n_turnover_days", 43))
 
-    # ── 1. 加载缓存数据 ────────────────────────────────────────────────────────
-    logger.info("=== 步骤 1/4  加载本地缓存数据 ===")
-    data = load_cache_data(data_dir, adjust=adjust, n_turnover_days=n_turn_days)
+    # ── 1. 加载本地日线数据 ───────────────────────────────────────────────────
+    logger.info("=== 步骤 1/4  加载本地日线数据 ===")
+    data = load_price_data(str(data_dir), adjust=adjust, n_turnover_days=n_turn_days)
     if not data:
         logger.error("未加载到任何数据，请先运行数据拉取步骤")
         return CandidateRun(run_date=datetime.now().strftime("%Y-%m-%d"), pick_date="")
@@ -160,7 +168,7 @@ def run(
     logger.info("=== 步骤 4/4  运行 B1 选股器 ===")
     selector   = B1Selector(b1_cfg)
     warmup     = selector.warmup_bars()
-    names      = _load_stock_names(data_dir)
+    names      = _load_stock_names(stock_list_file)
     candidates: List[Candidate] = []
     skipped    = 0
 
@@ -248,6 +256,8 @@ def run(
     logger.info("=" * 60)
     logger.info("选股完成！日期: %s", pd_ts.strftime("%Y-%m-%d"))
     logger.info("扫描 %d 只 | 跳过 %d 只 | 命中 %d 只", scanned, skipped, len(candidates))
+    if scanned > 0 and skipped == scanned:
+        logger.warning("本轮股票全部被跳过，通常说明本地历史数据长度不足，请先运行完整数据拉取。")
     logger.info("=" * 60)
 
     # 打印候选列表摘要

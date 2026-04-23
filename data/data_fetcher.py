@@ -1,9 +1,11 @@
-# A股数据获取模块
+from __future__ import annotations
+
+import json
 import logging
 import os
-import sys
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
@@ -11,54 +13,18 @@ from threading import Lock
 import pandas as pd
 import tushare as ts
 
-# 添加项目根目录到路径
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from config.config import DATA_CONFIG
-from indicators.kdj import KDJ
-from indicators.macd import MACD
-
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger(__name__)
 
-
-# pandas 2.2+ 兼容补丁，避免 tushare 内部旧式 fillna(method=...) 调用报错
-_orig_df_fillna = pd.DataFrame.fillna
-_orig_series_fillna = pd.Series.fillna
-
-
-def _patched_df_fillna(self, value=None, *, method=None, axis=None, inplace=False, limit=None, **kwargs):
-    if method is not None:
-        if method == "ffill":
-            return self.ffill(axis=axis, inplace=inplace, limit=limit)
-        if method == "bfill":
-            return self.bfill(axis=axis, inplace=inplace, limit=limit)
-        raise ValueError(f"Unsupported fillna method: {method}")
-    return _orig_df_fillna(self, value, axis=axis, inplace=inplace, limit=limit, **kwargs)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_DATA_ROOT = _PROJECT_ROOT / "data"
+_DEFAULT_RAW_DIR = _DATA_ROOT / "raw"
+_DEFAULT_STOCK_LIST_FILE = _DATA_ROOT / "stocklist.csv"
+_DEFAULT_FAILURE_DIR = _DATA_ROOT / "failures"
+_DEFAULT_ENV_FILE = _PROJECT_ROOT / ".env.local"
 
 
-def _patched_series_fillna(self, value=None, *, method=None, axis=None, inplace=False, limit=None, **kwargs):
-    if method is not None:
-        if method == "ffill":
-            return self.ffill(axis=axis, inplace=inplace, limit=limit)
-        if method == "bfill":
-            return self.bfill(axis=axis, inplace=inplace, limit=limit)
-        raise ValueError(f"Unsupported fillna method: {method}")
-    return _orig_series_fillna(self, value, axis=axis, inplace=inplace, limit=limit, **kwargs)
-
-
-pd.DataFrame.fillna = _patched_df_fillna  # type: ignore[method-assign]
-pd.Series.fillna = _patched_series_fillna  # type: ignore[method-assign]
-
-
-def _load_local_env_file():
-    """从项目根目录的 .env.local 读取本地密钥，避免提交到 GitHub。"""
-    project_root = Path(__file__).resolve().parent.parent
-    env_file = project_root / ".env.local"
+def _load_local_env_file(env_file: Path = _DEFAULT_ENV_FILE) -> None:
+    """从项目根目录的 .env.local 读取本地密钥。"""
     if not env_file.exists():
         return
 
@@ -73,55 +39,71 @@ def _load_local_env_file():
             if key and value and key not in os.environ:
                 os.environ[key] = value
     except Exception as exc:
-        logger.warning(f"读取 .env.local 失败: {exc}")
+        logger.warning("读取 %s 失败: %s", env_file, exc)
 
 
 class AStockDataFetcher:
-    """A股数据获取类（基于 TUShare）"""
+    """基于 TUShare 的 A 股日线抓取器，只保留当前 pipeline 主线所需能力。"""
 
-    def __init__(self):
-        """初始化数据获取器"""
-        self.stock_list = None
-        self.pro = None
+    def __init__(
+        self,
+        raw_dir: Path | None = None,
+        stock_list_file: Path | None = None,
+        failure_dir: Path | None = None,
+        rate_limit_per_minute: int = 195,
+        request_interval_seconds: float = 0.30,
+        max_retries: int = 3,
+        second_pass_enabled: bool = True,
+        second_pass_sleep_seconds: int = 8,
+        max_workers: int = 6,
+    ) -> None:
+        self.project_root = _PROJECT_ROOT
+        self.raw_dir = raw_dir or _DEFAULT_RAW_DIR
+        self.stock_list_file = stock_list_file or _DEFAULT_STOCK_LIST_FILE
+        self.failure_dir = failure_dir or _DEFAULT_FAILURE_DIR
 
-        self.data_root = Path(DATA_CONFIG.get("data_root", "data"))
-        self.raw_dir = Path(DATA_CONFIG.get("history_dir", self.data_root / "raw"))
-        self.stock_list_cache_file = Path(
-            DATA_CONFIG.get("stock_list_file", self.data_root / "stocklist.csv")
-        )
         self.raw_dir.mkdir(parents=True, exist_ok=True)
-        self.stock_list_cache_file.parent.mkdir(parents=True, exist_ok=True)
+        self.stock_list_file.parent.mkdir(parents=True, exist_ok=True)
+        self.failure_dir.mkdir(parents=True, exist_ok=True)
 
-        self.rate_limit_per_minute = int(DATA_CONFIG.get("rate_limit_per_minute", 180))
-        self.request_interval = float(DATA_CONFIG.get("request_interval_seconds", 0.35))
-        self.max_retries = int(DATA_CONFIG.get("max_retries", 3))
-        self.max_workers = int(DATA_CONFIG.get("max_workers", 3))
+        self.rate_limit_per_minute = rate_limit_per_minute
+        self.request_interval_seconds = request_interval_seconds
+        self.max_retries = max_retries
+        self.second_pass_enabled = second_pass_enabled
+        self.second_pass_sleep_seconds = second_pass_sleep_seconds
+        self.max_workers = max_workers
 
+        self.pro = None
+        self.stock_list = None
         self._request_times = deque()
         self._request_lock = Lock()
+        self._client_lock = Lock()
+        self._state_lock = Lock()
+        self.failed_symbols: dict[str, dict[str, str]] = {}
+        self.empty_symbols: set[str] = set()
 
     def _ensure_client(self):
-        """初始化 TUShare 客户端"""
         if self.pro is not None:
             return self.pro
 
-        _load_local_env_file()
-        token = os.environ.get("TUSHARE_TOKEN", "").strip()
-        if not token:
-            raise ValueError(
-                "未检测到 TUSHARE_TOKEN。请在项目根目录 .env.local 中填写，或设置系统环境变量。"
-            )
+        with self._client_lock:
+            if self.pro is not None:
+                return self.pro
 
-        os.environ["NO_PROXY"] = "api.waditu.com,.waditu.com,waditu.com"
-        os.environ["no_proxy"] = os.environ["NO_PROXY"]
-        ts.set_token(token)
-        self.pro = ts.pro_api()
-        logger.info("TUShare 客户端初始化成功")
-        return self.pro
+            _load_local_env_file()
+            token = os.environ.get("TUSHARE_TOKEN", "").strip()
+            if not token:
+                raise ValueError("未检测到 TUSHARE_TOKEN，请在项目根目录 .env.local 中填写。")
+
+            os.environ["NO_PROXY"] = "api.waditu.com,.waditu.com,waditu.com"
+            os.environ["no_proxy"] = os.environ["NO_PROXY"]
+            ts.set_token(token)
+            self.pro = ts.pro_api()
+            logger.info("TUShare 客户端初始化成功")
+            return self.pro
 
     @staticmethod
-    def _to_ts_code(symbol):
-        """6位股票代码转 ts_code"""
+    def _to_ts_code(symbol: str) -> str:
         symbol = str(symbol).zfill(6)
         if symbol.startswith(("60", "68", "90")):
             return f"{symbol}.SH"
@@ -129,26 +111,80 @@ class AStockDataFetcher:
             return f"{symbol}.BJ"
         return f"{symbol}.SZ"
 
-    def _history_cache_file(self, symbol, adjust):
-        """历史数据 CSV 路径"""
+    def _history_file(self, symbol: str, adjust: str = "qfq") -> Path:
         suffix = adjust or "bfq"
-        return self.raw_dir / f"{symbol}_{suffix}.csv"
+        return self.raw_dir / f"{str(symbol).zfill(6)}_{suffix}.csv"
 
-    def clear_history_cache(self, symbols, adjust="qfq"):
-        """清理指定股票的历史 CSV 缓存"""
+    def clear_history_cache(self, symbols: list[str], adjust: str = "qfq") -> int:
         deleted = 0
         for symbol in symbols:
-            cache_file = self._history_cache_file(symbol, adjust)
-            if cache_file.exists():
+            fpath = self._history_file(symbol, adjust)
+            if fpath.exists():
                 try:
-                    cache_file.unlink()
+                    fpath.unlink()
                     deleted += 1
                 except Exception as exc:
-                    logger.warning(f"删除缓存失败 {cache_file}: {exc}")
+                    logger.warning("删除缓存失败 %s: %s", fpath, exc)
         return deleted
 
-    def _throttle(self):
-        """简单限流，避免超过套餐频率"""
+    def _reset_run_state(self) -> None:
+        with self._state_lock:
+            self.failed_symbols = {}
+            self.empty_symbols = set()
+
+    def _record_failed_symbol(self, symbol: str, stage: str, error_message: str | Exception) -> None:
+        code = str(symbol).zfill(6)
+        with self._state_lock:
+            self.failed_symbols[code] = {
+                "symbol": code,
+                "stage": stage,
+                "error": str(error_message),
+                "recorded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+    def _clear_failed_symbol(self, symbol: str) -> None:
+        with self._state_lock:
+            self.failed_symbols.pop(str(symbol).zfill(6), None)
+
+    def _record_empty_symbol(self, symbol: str) -> None:
+        with self._state_lock:
+            self.empty_symbols.add(str(symbol).zfill(6))
+
+    def _clear_empty_symbol(self, symbol: str) -> None:
+        with self._state_lock:
+            self.empty_symbols.discard(str(symbol).zfill(6))
+
+    def _save_failure_reports(self, total_symbols: int) -> None:
+        with self._state_lock:
+            failed_symbols = list(self.failed_symbols.values())
+            empty_symbols = sorted(self.empty_symbols)
+
+        summary = {
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_symbols": total_symbols,
+            "failed_count": len(failed_symbols),
+            "empty_count": len(empty_symbols),
+            "failed_symbols": failed_symbols,
+            "empty_symbols": empty_symbols,
+        }
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        latest_json = self.failure_dir / "failed_symbols_latest.json"
+        dated_json = self.failure_dir / f"failed_symbols_{timestamp}.json"
+        latest_csv = self.failure_dir / "failed_symbols_latest.csv"
+
+        payload = json.dumps(summary, ensure_ascii=False, indent=2)
+        latest_json.write_text(payload, encoding="utf-8")
+        dated_json.write_text(payload, encoding="utf-8")
+
+        rows = failed_symbols
+        pd.DataFrame(rows or [{"symbol": "", "stage": "", "error": "", "recorded_at": ""}]).to_csv(
+            latest_csv,
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+    def _throttle(self) -> None:
         with self._request_lock:
             now = time.monotonic()
             while self._request_times and now - self._request_times[0] >= 60:
@@ -157,7 +193,7 @@ class AStockDataFetcher:
             if len(self._request_times) >= self.rate_limit_per_minute:
                 wait_seconds = 60 - (now - self._request_times[0]) + 0.2
                 if wait_seconds > 0:
-                    logger.info(f"接近 TUShare 频率上限，等待 {wait_seconds:.1f} 秒...")
+                    logger.info("接近 TUShare 频率上限，等待 %.1f 秒...", wait_seconds)
                     time.sleep(wait_seconds)
                     now = time.monotonic()
                     while self._request_times and now - self._request_times[0] >= 60:
@@ -165,14 +201,13 @@ class AStockDataFetcher:
 
             if self._request_times:
                 delta = now - self._request_times[-1]
-                if delta < self.request_interval:
-                    time.sleep(self.request_interval - delta)
+                if delta < self.request_interval_seconds:
+                    time.sleep(self.request_interval_seconds - delta)
                     now = time.monotonic()
 
             self._request_times.append(now)
 
     def _call_tushare(self, func, *args, **kwargs):
-        """带重试和限流的 TUShare 调用"""
         last_error = None
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -180,62 +215,19 @@ class AStockDataFetcher:
                 return func(*args, **kwargs)
             except Exception as exc:
                 last_error = exc
-                wait_seconds = attempt * 3
-                logger.warning(f"TUShare 调用失败，第 {attempt}/{self.max_retries} 次重试，{wait_seconds}s 后继续: {exc}")
+                wait_seconds = min(30, 3 * (2 ** (attempt - 1)))
+                logger.warning(
+                    "TUShare 调用失败，第 %d/%d 次重试，%ds 后继续: %s",
+                    attempt,
+                    self.max_retries,
+                    wait_seconds,
+                    exc,
+                )
                 time.sleep(wait_seconds)
         raise last_error
 
-    def _load_stock_list_cache(self):
-        """读取股票列表缓存"""
-        if self.stock_list_cache_file.exists():
-            try:
-                df = pd.read_csv(
-                    self.stock_list_cache_file,
-                    dtype={"代码": str, "symbol": str, "ts_code": str},
-                )
-                if not df.empty and "代码" in df.columns and "名称" in df.columns:
-                    logger.info(f"从本地 CSV 读取股票列表成功，共 {len(df)} 只")
-                    return df
-            except Exception as exc:
-                logger.warning(f"读取股票列表缓存失败: {exc}")
-        return pd.DataFrame()
-
-    def _save_stock_list_cache(self, df):
-        """保存股票列表缓存"""
-        try:
-            if df is not None and not df.empty:
-                df.to_csv(self.stock_list_cache_file, index=False, encoding="utf-8-sig")
-                logger.info(f"股票列表已保存至: {self.stock_list_cache_file}")
-        except Exception as exc:
-            logger.warning(f"保存股票列表缓存失败: {exc}")
-
-    def _load_full_history_cache(self, symbol, adjust):
-        """读取单只股票完整历史 CSV"""
-        cache_file = self._history_cache_file(symbol, adjust)
-        if cache_file.exists():
-            try:
-                df = pd.read_csv(cache_file)
-                df = self._normalize_history_dataframe(df)
-                if not df.empty:
-                    logger.debug(f"从本地 CSV 读取股票 {symbol} 历史数据，共 {len(df)} 条")
-                    return df
-            except Exception as exc:
-                logger.warning(f"读取股票 {symbol} 历史数据缓存失败: {exc}")
-        return pd.DataFrame()
-
-    def _save_full_history_cache(self, symbol, adjust, df):
-        """保存单只股票完整历史 CSV"""
-        try:
-            if df is not None and not df.empty:
-                cache_file = self._history_cache_file(symbol, adjust)
-                output = df.reset_index()
-                output.to_csv(cache_file, index=False, encoding="utf-8-sig")
-        except Exception as exc:
-            logger.warning(f"保存股票 {symbol} 历史数据缓存失败: {exc}")
-
     @staticmethod
-    def _normalize_history_dataframe(df):
-        """统一历史行情字段"""
+    def _normalize_history_dataframe(df: pd.DataFrame | None) -> pd.DataFrame:
         if df is None or df.empty:
             return pd.DataFrame()
 
@@ -253,59 +245,58 @@ class AStockDataFetcher:
             "涨跌额": "change",
             "换手率": "turnover",
             "vol": "volume",
-            "amount": "amount",
         }
         result = result.rename(columns=rename_map)
 
-        required_defaults = {
-            "volume": 0.0,
-            "amount": 0.0,
-            "pct_chg": 0.0,
-            "change": 0.0,
-            "turnover": 0.0,
-        }
-        for col, default_value in required_defaults.items():
-            if col not in result.columns:
-                result[col] = default_value
-
-        core_columns = ["date", "open", "close", "high", "low"]
-        if not all(col in result.columns for col in core_columns):
+        required = ["date", "open", "close", "high", "low"]
+        if not all(col in result.columns for col in required):
             return pd.DataFrame()
 
         result["date"] = pd.to_datetime(result["date"], errors="coerce")
-        numeric_columns = [
-            "open",
-            "close",
-            "high",
-            "low",
-            "volume",
-            "amount",
-            "pct_chg",
-            "change",
-            "turnover",
-        ]
-        for col in numeric_columns:
-            result[col] = pd.to_numeric(result[col], errors="coerce")
+        for col in ["open", "close", "high", "low", "volume", "amount", "pct_chg", "change", "turnover"]:
+            if col in result.columns:
+                result[col] = pd.to_numeric(result[col], errors="coerce")
+            else:
+                result[col] = 0.0
 
         result = result.dropna(subset=["date", "open", "close", "high", "low"])
         result = result.set_index("date").sort_index()
         return result
 
-    def get_stock_list(self):
-        """
-        获取 A 股股票列表
+    def _load_history_cache(self, symbol: str, adjust: str = "qfq") -> pd.DataFrame:
+        fpath = self._history_file(symbol, adjust)
+        if not fpath.exists():
+            return pd.DataFrame()
 
-        Returns:
-            pandas.DataFrame: 股票列表数据
-        """
         try:
-            logger.info("正在获取 A 股股票列表...")
+            return self._normalize_history_dataframe(pd.read_csv(fpath))
+        except Exception as exc:
+            logger.warning("读取历史缓存失败 %s: %s", fpath, exc)
+            return pd.DataFrame()
 
-            cached_df = self._load_stock_list_cache()
-            if not cached_df.empty:
-                self.stock_list = cached_df
-                return self.stock_list
+    def _save_history_cache(self, symbol: str, adjust: str, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        try:
+            df.reset_index().to_csv(self._history_file(symbol, adjust), index=False, encoding="utf-8-sig")
+        except Exception as exc:
+            logger.warning("保存历史缓存失败 %s: %s", symbol, exc)
 
+    def get_stock_list(self) -> pd.DataFrame:
+        if self.stock_list is not None and not self.stock_list.empty:
+            return self.stock_list
+
+        if self.stock_list_file.exists():
+            try:
+                cached = pd.read_csv(self.stock_list_file, dtype={"代码": str, "ts_code": str})
+                if not cached.empty and {"代码", "名称"}.issubset(cached.columns):
+                    self.stock_list = cached
+                    logger.info("从本地股票列表缓存读取成功，共 %d 只", len(cached))
+                    return cached
+            except Exception as exc:
+                logger.warning("读取股票列表缓存失败: %s", exc)
+
+        try:
             pro = self._ensure_client()
             stock_info = self._call_tushare(
                 pro.stock_basic,
@@ -319,150 +310,190 @@ class AStockDataFetcher:
             stock_info = stock_info.rename(columns={"symbol": "代码", "name": "名称"})
             stock_info["代码"] = stock_info["代码"].astype(str).str.zfill(6)
             self.stock_list = stock_info[["代码", "名称", "ts_code", "market", "list_date"]].copy()
-            self._save_stock_list_cache(self.stock_list)
-            logger.info(f"成功从 TUShare 获取 {len(self.stock_list)} 只股票信息")
+            self.stock_list.to_csv(self.stock_list_file, index=False, encoding="utf-8-sig")
+            logger.info("股票列表已保存至: %s", self.stock_list_file)
             return self.stock_list
-
         except Exception as exc:
-            logger.error(f"获取股票列表失败: {exc}")
+            logger.error("获取股票列表失败: %s", exc)
             return pd.DataFrame()
 
-    def _fetch_history_from_api(self, symbol, start_date, end_date, adjust="qfq"):
-        """
-        通过 TUShare 获取股票历史数据
+    def _fetch_history_from_api(self, symbol: str, start_date: str, end_date: str, adjust: str = "qfq") -> pd.DataFrame:
+        self._ensure_client()
+        ts_code = self._to_ts_code(symbol)
+        df = self._call_tushare(
+            ts.pro_bar,
+            ts_code=ts_code,
+            adj=adjust or None,
+            start_date=start_date,
+            end_date=end_date,
+            freq="D",
+            api=self.pro,
+        )
+        df = self._normalize_history_dataframe(df)
+        if not df.empty:
+            logger.info("TUShare 成功获取股票 %s 的 %d 条历史数据", symbol, len(df))
+        else:
+            logger.warning("股票 %s 在 TUShare 中未返回历史数据", symbol)
+        return df
 
-        Returns:
-            pandas.DataFrame: 获取到的历史数据，失败时返回空 DataFrame
-        """
-        try:
-            self._ensure_client()
-            ts_code = self._to_ts_code(symbol)
-            df = self._call_tushare(
-                ts.pro_bar,
-                ts_code=ts_code,
-                adj=adjust or None,
-                start_date=start_date,
-                end_date=end_date,
-                freq="D",
-                api=self.pro,
-            )
-            df = self._normalize_history_dataframe(df)
-            if not df.empty:
-                logger.info(f"TUShare 成功获取股票 {symbol} 的 {len(df)} 条历史数据")
-            else:
-                logger.warning(f"股票 {symbol} 在 TUShare 中未返回历史数据")
-            return df
-        except Exception as exc:
-            logger.warning(f"TUShare 获取股票 {symbol} 历史数据失败: {exc}")
-            return pd.DataFrame()
-
-    def get_stock_history(self, symbol, start_date=None, end_date=None, adjust="qfq", use_cache_only=False):
-        """
-        获取单只股票的历史数据（支持增量缓存）
-        """
-        if end_date is None:
-            end_date = datetime.now().strftime("%Y%m%d")
-        if start_date is None:
-            start_date = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
-
+    def get_stock_history(
+        self,
+        symbol: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        adjust: str = "qfq",
+        use_cache_only: bool = False,
+    ) -> pd.DataFrame:
+        end_date = end_date or datetime.now().strftime("%Y%m%d")
+        start_date = start_date or (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
 
         try:
-            existing_df = self._load_full_history_cache(symbol, adjust)
+            existing_df = self._load_history_cache(symbol, adjust)
 
             if not existing_df.empty:
+                cached_min_date = existing_df.index.min()
                 cached_max_date = existing_df.index.max()
-                if cached_max_date >= end_dt - timedelta(days=1):
+                has_head = cached_min_date <= start_dt + timedelta(days=7)
+                has_tail = cached_max_date >= end_dt - timedelta(days=1)
+
+                if has_head and has_tail:
                     result = existing_df[(existing_df.index >= start_dt) & (existing_df.index <= end_dt)]
-                    logger.info(f"命中本地 CSV 缓存：股票 {symbol}，共 {len(result)} 条")
+                    logger.info("命中本地数据：股票 %s，共 %d 条", symbol, len(result))
                     return result
 
                 if use_cache_only:
                     result = existing_df[(existing_df.index >= start_dt) & (existing_df.index <= end_dt)]
-                    logger.info(f"仅使用本地 CSV 缓存：股票 {symbol}，共 {len(result)} 条")
+                    logger.info("仅使用本地缓存：股票 %s，共 %d 条", symbol, len(result))
                     return result
 
-                fetch_start = (cached_max_date + timedelta(days=1)).strftime("%Y%m%d")
-                logger.info(f"增量获取股票 {symbol}：{fetch_start} ~ {end_date}")
-                new_df = self._fetch_history_from_api(symbol, fetch_start, end_date, adjust)
+                parts = [existing_df]
 
-                if not new_df.empty:
-                    merged = pd.concat([existing_df, new_df])
-                    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-                    self._save_full_history_cache(symbol, adjust, merged)
-                    return merged[(merged.index >= start_dt) & (merged.index <= end_dt)]
+                if not has_head:
+                    head_end = (cached_min_date - timedelta(days=1)).strftime("%Y%m%d")
+                    logger.info("补抓股票 %s 前段历史：%s ~ %s", symbol, start_date, head_end)
+                    try:
+                        head_df = self._fetch_history_from_api(symbol, start_date, head_end, adjust)
+                        if not head_df.empty:
+                            parts.append(head_df)
+                    except Exception as exc:
+                        self._record_failed_symbol(symbol, "head_backfill", exc)
+                        logger.warning("补抓股票 %s 前段历史失败，先使用现有缓存", symbol)
 
-                logger.warning(f"增量获取 {symbol} 失败，回退到已有本地 CSV")
-                return existing_df[(existing_df.index >= start_dt) & (existing_df.index <= end_dt)]
+                if not has_tail:
+                    tail_start = (cached_max_date + timedelta(days=1)).strftime("%Y%m%d")
+                    logger.info("增量获取股票 %s：%s ~ %s", symbol, tail_start, end_date)
+                    try:
+                        tail_df = self._fetch_history_from_api(symbol, tail_start, end_date, adjust)
+                        if not tail_df.empty:
+                            parts.append(tail_df)
+                    except Exception as exc:
+                        self._record_failed_symbol(symbol, "tail_backfill", exc)
+                        logger.warning("增量获取 %s 失败，先使用现有缓存", symbol)
+
+                merged = pd.concat(parts)
+                merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+                self._save_history_cache(symbol, adjust, merged)
+                self._clear_failed_symbol(symbol)
+                self._clear_empty_symbol(symbol)
+                return merged[(merged.index >= start_dt) & (merged.index <= end_dt)]
 
             if use_cache_only:
-                logger.warning(f"股票 {symbol} 无本地 CSV 缓存，且已禁用网络获取")
+                logger.warning("股票 %s 无本地缓存，且已禁用网络获取", symbol)
                 return pd.DataFrame()
 
-            logger.info(f"全量获取股票 {symbol}：{start_date} ~ {end_date}")
-            new_df = self._fetch_history_from_api(symbol, start_date, end_date, adjust)
-            if not new_df.empty:
-                self._save_full_history_cache(symbol, adjust, new_df)
-            return new_df
+            logger.info("全量获取股票 %s：%s ~ %s", symbol, start_date, end_date)
+            try:
+                new_df = self._fetch_history_from_api(symbol, start_date, end_date, adjust)
+            except Exception as exc:
+                self._record_failed_symbol(symbol, "full_fetch", exc)
+                return pd.DataFrame()
 
+            if new_df.empty:
+                self._record_empty_symbol(symbol)
+                return pd.DataFrame()
+
+            self._save_history_cache(symbol, adjust, new_df)
+            self._clear_failed_symbol(symbol)
+            self._clear_empty_symbol(symbol)
+            return new_df
         except Exception as exc:
-            logger.error(f"获取股票 {symbol} 历史数据失败: {exc}")
+            self._record_failed_symbol(symbol, "get_stock_history", exc)
+            logger.error("获取股票 %s 历史数据失败: %s", symbol, exc)
             return pd.DataFrame()
 
-    def get_multiple_stocks_history(self, symbols, start_date=None, end_date=None, adjust="qfq", use_cache_only=False):
-        """
-        批量获取多只股票的历史数据
-        """
-        stock_data = {}
+    def get_multiple_stocks_history(
+        self,
+        symbols: list[str],
+        start_date: str | None = None,
+        end_date: str | None = None,
+        adjust: str = "qfq",
+        use_cache_only: bool = False,
+    ) -> dict[str, pd.DataFrame]:
+        self._reset_run_state()
+        stock_data: dict[str, pd.DataFrame] = {}
         total = len(symbols)
 
-        for index, symbol in enumerate(symbols, start=1):
-            try:
-                df = self.get_stock_history(symbol, start_date, end_date, adjust, use_cache_only=use_cache_only)
-                if not df.empty:
-                    stock_data[symbol] = df
-                if index % 10 == 0 or index == total:
-                    logger.info(f"已完成获取 {index}/{total} 只股票的数据")
-            except Exception as exc:
-                logger.warning(f"获取股票 {symbol} 数据异常: {exc}")
+        worker_count = max(1, min(self.max_workers, total))
+        logger.info(
+            "开始并发抓取 %d 只股票，工作线程 %d，限频 %d/min",
+            total,
+            worker_count,
+            self.rate_limit_per_minute,
+        )
 
-        logger.info(f"成功获取 {len(stock_data)}/{total} 只股票的历史数据")
+        def _fetch_one(symbol: str) -> tuple[str, pd.DataFrame]:
+            return str(symbol).zfill(6), self.get_stock_history(symbol, start_date, end_date, adjust, use_cache_only)
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {executor.submit(_fetch_one, symbol): str(symbol).zfill(6) for symbol in symbols}
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    code, df = future.result()
+                    if not df.empty:
+                        stock_data[code] = df
+                except Exception as exc:
+                    self._record_failed_symbol(symbol, "parallel_batch_fetch", exc)
+                    logger.warning("并发获取股票 %s 数据异常: %s", symbol, exc)
+                completed += 1
+                if completed % 10 == 0 or completed == total:
+                    logger.info("已完成获取 %d/%d 只股票的数据", completed, total)
+
+        with self._state_lock:
+            retry_symbols = sorted(self.failed_symbols.keys())
+
+        if self.second_pass_enabled and retry_symbols and not use_cache_only:
+            logger.warning(
+                "首轮有 %d 只股票抓取失败，%ds 后开始二次补抓...",
+                len(retry_symbols),
+                self.second_pass_sleep_seconds,
+            )
+            time.sleep(self.second_pass_sleep_seconds)
+            retry_completed = 0
+            retry_workers = max(1, min(self.max_workers, len(retry_symbols)))
+            with ThreadPoolExecutor(max_workers=retry_workers) as executor:
+                futures = {executor.submit(_fetch_one, symbol): symbol for symbol in retry_symbols}
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        code, df = future.result()
+                        if not df.empty:
+                            stock_data[code] = df
+                            self._clear_failed_symbol(symbol)
+                            self._clear_empty_symbol(symbol)
+                    except Exception as exc:
+                        self._record_failed_symbol(symbol, "second_pass_fetch", exc)
+                        logger.warning("二次补抓 %s 失败: %s", symbol, exc)
+                    retry_completed += 1
+                    logger.info("二次补抓进度 %d/%d", retry_completed, len(retry_symbols))
+
+        self._save_failure_reports(total)
+        logger.info("成功获取 %d/%d 只股票的历史数据", len(stock_data), total)
+        with self._state_lock:
+            failed_count = len(self.failed_symbols)
+        if failed_count:
+            logger.warning("仍有 %d 只股票抓取失败，详情见 %s", failed_count, self.failure_dir)
         return stock_data
-
-    def get_stock_realtime(self, symbol):
-        """
-        获取股票实时数据（使用最近一个交易日收盘数据近似代替）
-        """
-        try:
-            logger.info(f"正在获取股票 {symbol} 的最新行情...")
-            end_date = datetime.now().strftime("%Y%m%d")
-            start_date = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
-            df = self._fetch_history_from_api(symbol, start_date, end_date, adjust="qfq")
-            if df.empty:
-                return pd.DataFrame()
-            latest = df.reset_index().tail(1)
-            latest["代码"] = str(symbol).zfill(6)
-            return latest
-        except Exception as exc:
-            logger.error(f"获取股票 {symbol} 最新行情失败: {exc}")
-            return pd.DataFrame()
-
-    def calculate_indicators(self, df):
-        """
-        计算技术指标（KDJ 和 MACD）
-        """
-        if df.empty:
-            return df
-
-        try:
-            kdj = KDJ(period=9, signal=3)
-            df_with_kdj = kdj.calculate(df)
-
-            macd = MACD(fast=12, slow=26, signal=9)
-            df_with_indicators = macd.calculate(df_with_kdj)
-
-            return df_with_indicators
-        except Exception as exc:
-            logger.error(f"计算技术指标失败: {exc}")
-            return df

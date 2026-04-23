@@ -34,8 +34,12 @@ ENV/
 # Output files
 output/
 
-# Data cache
+# Generated data
 data/cache/
+data/raw/
+data/candidates/
+data/failures/
+data/stocklist.csv
 
 # Logs
 *.log
