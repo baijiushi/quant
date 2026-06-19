@@ -1,0 +1,2 @@
+"""Volume new-high strategy."""
+

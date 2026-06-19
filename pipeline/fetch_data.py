@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -45,6 +46,7 @@ def run(
     symbols: list[str] | None = None,
     use_cache_only: bool = False,
     force_refresh: bool = False,
+    stop_event: threading.Event | None = None,
 ) -> None:
     """
     拉取 / 更新股票历史数据。
@@ -77,6 +79,7 @@ def run(
         second_pass_enabled=second_pass_enabled,
         second_pass_sleep_seconds=second_pass_sleep_seconds,
         max_workers=max_workers,
+        stop_event=stop_event,
     )
 
     if symbols is None:

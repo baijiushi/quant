@@ -1,32 +1,40 @@
-# rules_preselect.yaml — 量化初选规则配置
-
-# ── 全局设置 ─────────────────────────────────────────────────────────────────
+active_strategy: b1
 global:
-  data_dir: "data/raw"            # 日线 CSV 数据目录
-  stock_list_file: "data/stocklist.csv"
-  output_dir: "data/candidates"   # 候选结果输出目录
-  adjust: "qfq"                   # 复权类型
-  top_m: 3000                     # 流动性池：取成交额最高的 top_m 只（0 = 不过滤）
-  n_turnover_days: 43             # 滚动成交额计算窗口（日）
-
-# ── B1 策略参数（KDJ 超卖 + 知行均线多头排列 + 周线确认）────────────────────
-b1:
-  enabled: true
-
-  # KDJ 参数
-  kdj_period: 9          # KDJ 计算周期
-
-  # 超卖判断：J 值低于此阈值视为超卖
-  j_threshold: 30.0
-
-  # 知行均线周期（日线 SMA）
-  zx_m1: 14
-  zx_m2: 28
-  zx_m3: 57
-  zx_m4: 114
-
-  # 周线均线多头排列（WMA_short > WMA_mid > WMA_long）
-  require_weekly_ma_bull: true
-  wma_short: 5
-  wma_mid: 10
-  wma_long: 20
+  data_dir: data/raw
+  stock_list_file: data/stocklist.csv
+  output_dir: data/candidates
+  adjust: qfq
+  top_m: 3000
+  n_turnover_days: 3000
+  markets:
+  - star
+  - gem
+  - main
+strategies:
+  b1:
+    enabled: true
+    kdj_period: 9
+    j_threshold: 20
+    zx_m1: 14
+    zx_m2: 28
+    zx_m3: 57
+    zx_m4: 114
+    require_weekly_ma_bull: true
+    wma_short: 5
+    wma_mid: 10
+    wma_long: 20
+    require_macd_bull: true
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    require_volume_ratio: false
+    volume_ma_window: 20
+    min_volume_ratio: 1.2
+  volume_new_high:
+    enabled: true
+    corr_window: 20
+    stddev_window: 20
+    new_high_window: 30
+    volume_ma_window: 20
+    max_volume_ratio: 0.9
+    min_score: 0

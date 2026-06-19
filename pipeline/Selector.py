@@ -101,6 +101,35 @@ def compute_weekly_ma(df: pd.DataFrame,
     )
 
 
+def compute_macd(
+    df: pd.DataFrame,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> pd.DataFrame:
+    """计算 MACD 指标。"""
+    if df.empty:
+        return df.assign(macd_dif=np.nan, macd_dea=np.nan, macd_hist=np.nan)
+
+    close = df["close"]
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    dif = ema_fast - ema_slow
+    dea = dif.ewm(span=signal, adjust=False).mean()
+    hist = (dif - dea) * 2
+    return df.assign(macd_dif=dif, macd_dea=dea, macd_hist=hist)
+
+
+def compute_volume_ratio(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    """计算当日成交量相对均量倍数。"""
+    if df.empty or "volume" not in df.columns:
+        return df.assign(volume_ma=np.nan, volume_ratio=np.nan)
+
+    volume_ma = df["volume"].rolling(window, min_periods=1).mean()
+    volume_ratio = df["volume"] / volume_ma.replace(0, np.nan)
+    return df.assign(volume_ma=volume_ma, volume_ratio=volume_ratio.fillna(0.0))
+
+
 # =============================================================================
 # B1 选股器
 # =============================================================================
@@ -126,11 +155,18 @@ class B1Selector:
         self.wma_s       = int(cfg.get("wma_short",             5))
         self.wma_m       = int(cfg.get("wma_mid",              10))
         self.wma_l       = int(cfg.get("wma_long",             20))
+        self.req_macd    = bool(cfg.get("require_macd_bull", False))
+        self.macd_fast   = int(cfg.get("macd_fast", 12))
+        self.macd_slow   = int(cfg.get("macd_slow", 26))
+        self.macd_signal = int(cfg.get("macd_signal", 9))
+        self.req_volume  = bool(cfg.get("require_volume_ratio", False))
+        self.volume_win  = int(cfg.get("volume_ma_window", 20))
+        self.min_vol_ratio = float(cfg.get("min_volume_ratio", 1.2))
 
     def warmup_bars(self) -> int:
         """运行策略所需的最少历史 bar 数（含预热期）。"""
         # 最长均线 + 周线最长均线对应日线数 + 缓冲
-        return self.m4 + self.wma_l * 5 + 30
+        return max(self.m4 + self.wma_l * 5, self.macd_slow + self.macd_signal, self.volume_win) + 30
 
     def prepare_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -141,6 +177,10 @@ class B1Selector:
         df = compute_zx_ma(df, self.m1, self.m2, self.m3, self.m4)
         if self.req_weekly:
             df = compute_weekly_ma(df, self.wma_s, self.wma_m, self.wma_l)
+        if self.req_macd:
+            df = compute_macd(df, self.macd_fast, self.macd_slow, self.macd_signal)
+        if self.req_volume:
+            df = compute_volume_ratio(df, self.volume_win)
 
         # 条件 1：KDJ J 值超卖
         j_cond = df["J"] < self.j_threshold
@@ -161,7 +201,17 @@ class B1Selector:
         else:
             wma_cond = pd.Series(True, index=df.index)
 
-        df["_vec_pick"] = j_cond & zx_cond & wma_cond
+        if self.req_macd:
+            macd_cond = (df["macd_dif"] > df["macd_dea"]) & (df["macd_hist"] > 0)
+        else:
+            macd_cond = pd.Series(True, index=df.index)
+
+        if self.req_volume:
+            volume_cond = df["volume_ratio"] >= self.min_vol_ratio
+        else:
+            volume_cond = pd.Series(True, index=df.index)
+
+        df["_vec_pick"] = j_cond & zx_cond & wma_cond & macd_cond & volume_cond
         return df
 
     def passes_on_date(self, df: pd.DataFrame, date: pd.Timestamp) -> bool:

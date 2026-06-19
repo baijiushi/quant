@@ -9,6 +9,7 @@ pipeline/pipeline_core.py
 from __future__ import annotations
 
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -16,6 +17,8 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+from pipeline.cancellation import raise_if_cancelled
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +106,7 @@ def load_price_data(
     symbols: Optional[List[str]] = None,
     n_turnover_days: int = 43,
     max_workers: int = 8,
+    stop_event: threading.Event | None = None,
 ) -> Dict[str, pd.DataFrame]:
     """
     从日线目录批量加载股票数据（{code}_{adjust}.csv），
@@ -124,6 +128,7 @@ def load_price_data(
 
     files: Dict[str, Path] = {}
     for f in data_path.glob(f"*_{adjust}.csv"):
+        raise_if_cancelled(stop_event)
         code = f.stem[: -(len(adjust) + 1)]  # 去掉 _{adjust} 后缀
         if symbols is None or code in symbols:
             files[code] = f
@@ -137,14 +142,25 @@ def load_price_data(
     result: Dict[str, pd.DataFrame] = {}
     items = list(files.items())
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         futures = {executor.submit(_load_one_csv, item, n_turnover_days): item[0]
                    for item in items}
+        completed = 0
         for future in tqdm(as_completed(futures), total=len(futures),
                            desc="加载缓存数据", unit="只"):
+            raise_if_cancelled(stop_event)
             code, df = future.result()
             if not df.empty:
                 result[code] = df
+            completed += 1
+            if completed % 500 == 0 or completed == len(futures):
+                logger.info("加载缓存数据进度 %d/%d，只成功 %d 只", completed, len(futures), len(result))
+    except Exception:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
 
     logger.info("成功加载 %d / %d 只股票数据", len(result), len(files))
     return result
@@ -154,6 +170,7 @@ def build_top_turnover_pool(
     data: Dict[str, pd.DataFrame],
     top_m: int,
     pick_date: pd.Timestamp,
+    stop_event: threading.Event | None = None,
 ) -> Optional[Set[str]]:
     """
     按 pick_date 当日的 turnover_n 降序排名，返回前 top_m 只股票代码集合。
@@ -164,6 +181,7 @@ def build_top_turnover_pool(
 
     rows: List[Tuple[str, float]] = []
     for code, df in data.items():
+        raise_if_cancelled(stop_event)
         if pick_date in df.index and "turnover_n" in df.columns:
             val = df.loc[pick_date, "turnover_n"]
             # 索引有重复日期时 loc 返回 Series，取最后一个值转为标量

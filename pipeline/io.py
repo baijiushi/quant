@@ -34,11 +34,14 @@ def save_candidates(run: CandidateRun, output_dir: str) -> Path:
 
     payload = json.dumps(run.to_dict(), ensure_ascii=False, indent=2, default=str)
 
-    dated_file = out / f"candidates_{run.pick_date}.json"
+    strategy_id = str(run.meta.get("strategy") or "unknown")
+    dated_file = out / f"candidates_{strategy_id}_{run.pick_date}.json"
     dated_file.write_text(payload, encoding="utf-8")
 
     latest_file = out / "candidates_latest.json"
     latest_file.write_text(payload, encoding="utf-8")
+    strategy_latest_file = out / f"candidates_latest_{strategy_id}.json"
+    strategy_latest_file.write_text(payload, encoding="utf-8")
 
     logger.info("候选结果已保存：%s（共 %d 只）", dated_file, len(run.candidates))
     return dated_file

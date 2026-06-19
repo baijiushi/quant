@@ -1,10 +1,8 @@
-# fetch_data.yaml — 数据拉取配置
-
 data:
-  adjust: "qfq"          # 复权类型：qfq 前复权 / hfq 后复权 / "" 不复权
-  history_days: 700      # B1 需要更长历史，便于日线/周线均线和 KDJ 充分预热
+  adjust: qfq
+  history_days: 700
   rate_limit_per_minute: 195
-  request_interval_seconds: 0.30
+  request_interval_seconds: 0.3
   max_retries: 3
   second_pass_enabled: true
   second_pass_sleep_seconds: 8

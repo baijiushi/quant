@@ -1,0 +1,13 @@
+deepseek:
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-flash
+  temperature: 0.2
+  max_tokens: 4096
+
+scoring:
+  max_source_chars: 24000
+  max_candidates_per_run: 20
+  sector_output_dir: data/ai_scoring
+  candidate_output_dir: data/ai_scoring
+  news_input_dir: data/news_inputs
+  source_urls: []

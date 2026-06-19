@@ -34,6 +34,7 @@ def _cmd_preselect(args: argparse.Namespace) -> None:
         config_path=args.config,
         output_dir=args.output_dir,
         pick_date=args.pick_date,
+        strategy_id=args.strategy_id,
     )
 
 
@@ -51,6 +52,7 @@ def main() -> None:
     p_pre.add_argument("--config",     default=None, help="rules_preselect.yaml 路径")
     p_pre.add_argument("--output-dir", default=None, help="候选结果输出目录")
     p_pre.add_argument("--pick-date",  default=None, help="选股基准日期，格式 YYYY-MM-DD")
+    p_pre.add_argument("--strategy-id", default=None, help="策略 ID：b1 或 volume_new_high")
     p_pre.set_defaults(func=_cmd_preselect)
 
     args = parser.parse_args()

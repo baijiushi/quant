@@ -1,38 +1,20 @@
-"""
-pipeline/schemas.py
-候选股票的数据结构定义（纯 dataclass，无第三方依赖）。
-"""
+"""Shared schema objects for strategy runs."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 @dataclass
 class Candidate:
-    """单只候选股票的结构化信息。"""
-    code: str               # 股票代码，如 "000001"
-    name: str               # 股票名称
-    date: str               # 选股日期，ISO 格式 "YYYY-MM-DD"
-    strategy: str           # 来源策略，如 "b1"
-    close: float            # 选股日收盘价
-    turnover_n: float       # 滚动成交额（流动性代理）
-
-    # KDJ 指标
-    J: float
-    K: float
-    D: float
-
-    # 知行均线
-    ma14: float
-    ma28: float
-    ma57: float
-    ma114: float
-
-    # 条件命中情况
-    zx_aligned: bool        # 知行均线是否多头排列
-    weekly_aligned: bool    # 周线均线是否多头排列
-
+    """Generic candidate emitted by any stock-selection strategy."""
+    code: str
+    name: str
+    date: str
+    strategy: str
+    close: float
+    turnover_n: float
+    score: float = 0.0
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -44,9 +26,9 @@ class Candidate:
 
 @dataclass
 class CandidateRun:
-    """一次完整初选运行的结果，写入 candidates_YYYY-MM-DD.json。"""
-    run_date: str                          # 运行日期（ISO）
-    pick_date: str                         # 选股基准日期（ISO）
+    """A complete strategy run result."""
+    run_date: str
+    pick_date: str
     candidates: List[Candidate] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
 
@@ -61,10 +43,17 @@ class CandidateRun:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "CandidateRun":
         fields = Candidate.__dataclass_fields__
-        candidates = [
-            Candidate(**{k: v for k, v in c.items() if k in fields})
-            for c in d.get("candidates", [])
-        ]
+        candidates: List[Candidate] = []
+        for item in d.get("candidates", []):
+            payload = {k: v for k, v in item.items() if k in fields}
+            extra = dict(item.get("extra") or {})
+            # Backward compatibility for old B1 candidate JSON files.
+            for key in ["J", "K", "D", "ma14", "ma28", "ma57", "ma114", "zx_aligned", "weekly_aligned"]:
+                if key in item and key not in extra:
+                    extra[key] = item[key]
+            payload.setdefault("score", float(extra.get("score", item.get("J", 0.0)) or 0.0))
+            payload["extra"] = extra
+            candidates.append(Candidate(**payload))
         return cls(
             run_date=d.get("run_date", ""),
             pick_date=d.get("pick_date", ""),

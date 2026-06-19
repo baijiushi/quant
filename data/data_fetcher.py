@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,6 +13,8 @@ from threading import Lock
 
 import pandas as pd
 import tushare as ts
+
+from pipeline.cancellation import RunCancelledError, raise_if_cancelled
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,7 @@ class AStockDataFetcher:
         second_pass_enabled: bool = True,
         second_pass_sleep_seconds: int = 8,
         max_workers: int = 6,
+        stop_event: threading.Event | None = None,
     ) -> None:
         self.project_root = _PROJECT_ROOT
         self.raw_dir = raw_dir or _DEFAULT_RAW_DIR
@@ -72,6 +76,7 @@ class AStockDataFetcher:
         self.second_pass_enabled = second_pass_enabled
         self.second_pass_sleep_seconds = second_pass_sleep_seconds
         self.max_workers = max_workers
+        self.stop_event = stop_event
 
         self.pro = None
         self.stock_list = None
@@ -82,7 +87,11 @@ class AStockDataFetcher:
         self.failed_symbols: dict[str, dict[str, str]] = {}
         self.empty_symbols: set[str] = set()
 
+    def _check_cancelled(self) -> None:
+        raise_if_cancelled(self.stop_event)
+
     def _ensure_client(self):
+        self._check_cancelled()
         if self.pro is not None:
             return self.pro
 
@@ -118,6 +127,7 @@ class AStockDataFetcher:
     def clear_history_cache(self, symbols: list[str], adjust: str = "qfq") -> int:
         deleted = 0
         for symbol in symbols:
+            self._check_cancelled()
             fpath = self._history_file(symbol, adjust)
             if fpath.exists():
                 try:
@@ -186,6 +196,7 @@ class AStockDataFetcher:
 
     def _throttle(self) -> None:
         with self._request_lock:
+            self._check_cancelled()
             now = time.monotonic()
             while self._request_times and now - self._request_times[0] >= 60:
                 self._request_times.popleft()
@@ -194,7 +205,7 @@ class AStockDataFetcher:
                 wait_seconds = 60 - (now - self._request_times[0]) + 0.2
                 if wait_seconds > 0:
                     logger.info("接近 TUShare 频率上限，等待 %.1f 秒...", wait_seconds)
-                    time.sleep(wait_seconds)
+                    self._sleep_with_cancel(wait_seconds)
                     now = time.monotonic()
                     while self._request_times and now - self._request_times[0] >= 60:
                         self._request_times.popleft()
@@ -202,18 +213,29 @@ class AStockDataFetcher:
             if self._request_times:
                 delta = now - self._request_times[-1]
                 if delta < self.request_interval_seconds:
-                    time.sleep(self.request_interval_seconds - delta)
+                    self._sleep_with_cancel(self.request_interval_seconds - delta)
                     now = time.monotonic()
 
             self._request_times.append(now)
+
+    def _sleep_with_cancel(self, seconds: float) -> None:
+        remaining = max(0.0, seconds)
+        while remaining > 0:
+            self._check_cancelled()
+            step = min(0.5, remaining)
+            time.sleep(step)
+            remaining -= step
 
     def _call_tushare(self, func, *args, **kwargs):
         last_error = None
         for attempt in range(1, self.max_retries + 1):
             try:
+                self._check_cancelled()
                 self._throttle()
                 return func(*args, **kwargs)
             except Exception as exc:
+                if isinstance(exc, RunCancelledError):
+                    raise
                 last_error = exc
                 wait_seconds = min(30, 3 * (2 ** (attempt - 1)))
                 logger.warning(
@@ -223,7 +245,7 @@ class AStockDataFetcher:
                     wait_seconds,
                     exc,
                 )
-                time.sleep(wait_seconds)
+                self._sleep_with_cancel(wait_seconds)
         raise last_error
 
     @staticmethod
@@ -283,6 +305,7 @@ class AStockDataFetcher:
             logger.warning("保存历史缓存失败 %s: %s", symbol, exc)
 
     def get_stock_list(self) -> pd.DataFrame:
+        self._check_cancelled()
         if self.stock_list is not None and not self.stock_list.empty:
             return self.stock_list
 
@@ -314,10 +337,13 @@ class AStockDataFetcher:
             logger.info("股票列表已保存至: %s", self.stock_list_file)
             return self.stock_list
         except Exception as exc:
+            if isinstance(exc, RunCancelledError):
+                raise
             logger.error("获取股票列表失败: %s", exc)
             return pd.DataFrame()
 
     def _fetch_history_from_api(self, symbol: str, start_date: str, end_date: str, adjust: str = "qfq") -> pd.DataFrame:
+        self._check_cancelled()
         self._ensure_client()
         ts_code = self._to_ts_code(symbol)
         df = self._call_tushare(
@@ -344,12 +370,14 @@ class AStockDataFetcher:
         adjust: str = "qfq",
         use_cache_only: bool = False,
     ) -> pd.DataFrame:
+        self._check_cancelled()
         end_date = end_date or datetime.now().strftime("%Y%m%d")
         start_date = start_date or (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
 
         try:
+            self._check_cancelled()
             existing_df = self._load_history_cache(symbol, adjust)
 
             if not existing_df.empty:
@@ -371,6 +399,7 @@ class AStockDataFetcher:
                 parts = [existing_df]
 
                 if not has_head:
+                    self._check_cancelled()
                     head_end = (cached_min_date - timedelta(days=1)).strftime("%Y%m%d")
                     logger.info("补抓股票 %s 前段历史：%s ~ %s", symbol, start_date, head_end)
                     try:
@@ -378,10 +407,13 @@ class AStockDataFetcher:
                         if not head_df.empty:
                             parts.append(head_df)
                     except Exception as exc:
+                        if isinstance(exc, RunCancelledError):
+                            raise
                         self._record_failed_symbol(symbol, "head_backfill", exc)
                         logger.warning("补抓股票 %s 前段历史失败，先使用现有缓存", symbol)
 
                 if not has_tail:
+                    self._check_cancelled()
                     tail_start = (cached_max_date + timedelta(days=1)).strftime("%Y%m%d")
                     logger.info("增量获取股票 %s：%s ~ %s", symbol, tail_start, end_date)
                     try:
@@ -389,6 +421,8 @@ class AStockDataFetcher:
                         if not tail_df.empty:
                             parts.append(tail_df)
                     except Exception as exc:
+                        if isinstance(exc, RunCancelledError):
+                            raise
                         self._record_failed_symbol(symbol, "tail_backfill", exc)
                         logger.warning("增量获取 %s 失败，先使用现有缓存", symbol)
 
@@ -407,6 +441,8 @@ class AStockDataFetcher:
             try:
                 new_df = self._fetch_history_from_api(symbol, start_date, end_date, adjust)
             except Exception as exc:
+                if isinstance(exc, RunCancelledError):
+                    raise
                 self._record_failed_symbol(symbol, "full_fetch", exc)
                 return pd.DataFrame()
 
@@ -419,6 +455,8 @@ class AStockDataFetcher:
             self._clear_empty_symbol(symbol)
             return new_df
         except Exception as exc:
+            if isinstance(exc, RunCancelledError):
+                raise
             self._record_failed_symbol(symbol, "get_stock_history", exc)
             logger.error("获取股票 %s 历史数据失败: %s", symbol, exc)
             return pd.DataFrame()
@@ -431,6 +469,7 @@ class AStockDataFetcher:
         adjust: str = "qfq",
         use_cache_only: bool = False,
     ) -> dict[str, pd.DataFrame]:
+        self._check_cancelled()
         self._reset_run_state()
         stock_data: dict[str, pd.DataFrame] = {}
         total = len(symbols)
@@ -447,36 +486,48 @@ class AStockDataFetcher:
             return str(symbol).zfill(6), self.get_stock_history(symbol, start_date, end_date, adjust, use_cache_only)
 
         completed = 0
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        executor = ThreadPoolExecutor(max_workers=worker_count)
+        try:
             futures = {executor.submit(_fetch_one, symbol): str(symbol).zfill(6) for symbol in symbols}
             for future in as_completed(futures):
+                self._check_cancelled()
                 symbol = futures[future]
                 try:
                     code, df = future.result()
                     if not df.empty:
                         stock_data[code] = df
                 except Exception as exc:
+                    if isinstance(exc, RunCancelledError):
+                        raise
                     self._record_failed_symbol(symbol, "parallel_batch_fetch", exc)
                     logger.warning("并发获取股票 %s 数据异常: %s", symbol, exc)
                 completed += 1
                 if completed % 10 == 0 or completed == total:
                     logger.info("已完成获取 %d/%d 只股票的数据", completed, total)
+        except Exception:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
 
         with self._state_lock:
             retry_symbols = sorted(self.failed_symbols.keys())
 
         if self.second_pass_enabled and retry_symbols and not use_cache_only:
+            self._check_cancelled()
             logger.warning(
                 "首轮有 %d 只股票抓取失败，%ds 后开始二次补抓...",
                 len(retry_symbols),
                 self.second_pass_sleep_seconds,
             )
-            time.sleep(self.second_pass_sleep_seconds)
+            self._sleep_with_cancel(self.second_pass_sleep_seconds)
             retry_completed = 0
             retry_workers = max(1, min(self.max_workers, len(retry_symbols)))
-            with ThreadPoolExecutor(max_workers=retry_workers) as executor:
+            executor = ThreadPoolExecutor(max_workers=retry_workers)
+            try:
                 futures = {executor.submit(_fetch_one, symbol): symbol for symbol in retry_symbols}
                 for future in as_completed(futures):
+                    self._check_cancelled()
                     symbol = futures[future]
                     try:
                         code, df = future.result()
@@ -485,10 +536,17 @@ class AStockDataFetcher:
                             self._clear_failed_symbol(symbol)
                             self._clear_empty_symbol(symbol)
                     except Exception as exc:
+                        if isinstance(exc, RunCancelledError):
+                            raise
                         self._record_failed_symbol(symbol, "second_pass_fetch", exc)
                         logger.warning("二次补抓 %s 失败: %s", symbol, exc)
                     retry_completed += 1
                     logger.info("二次补抓进度 %d/%d", retry_completed, len(retry_symbols))
+            except Exception:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
 
         self._save_failure_reports(total)
         logger.info("成功获取 %d/%d 只股票的历史数据", len(stock_data), total)

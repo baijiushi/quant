@@ -5,25 +5,25 @@ run_all.py
 
 步骤 1  pipeline/fetch_data.py    — 增量拉取 / 更新 K 线数据
 步骤 2  pipeline/select_stock.py  — B1 量化初选，生成候选列表 JSON
-步骤 3  streamlit run dashboard/app.py — 启动看盘界面
+步骤 3  web + backend            — 新版 Vue 控制台
 
 用法：
-    python run_all.py                        # 完整流程（增量更新数据 + 选股 + 启动看板）
+    python run_all.py                        # 完整流程（增量更新数据 + 选股 + 提示控制台启动方式）
     python run_all.py --skip-fetch           # 跳过数据下载
     python run_all.py --start-from 2         # 从第 2 步开始
-    python run_all.py --no-dashboard         # 选股后不启动看板（仅输出 JSON）
+    python run_all.py --no-dashboard         # 选股后不提示控制台启动方式
     python run_all.py --pick-date 2026-04-22 # 指定选股日期
 """
 from __future__ import annotations
 
 import argparse
 import logging
-import subprocess
 import sys
 from pathlib import Path
 
+from pipeline.runtime import run_pipeline
+
 ROOT   = Path(__file__).resolve().parent
-PYTHON = sys.executable
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,18 +35,6 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # 工具函数
 # =============================================================================
-
-def _run(step_name: str, cmd: list[str]) -> None:
-    """运行子进程，失败时终止整个流程。"""
-    print(f"\n{'=' * 60}")
-    print(f"[步骤] {step_name}")
-    print(f"  命令: {' '.join(cmd)}")
-    print(f"{'=' * 60}")
-    result = subprocess.run(cmd, cwd=str(ROOT))
-    if result.returncode != 0:
-        print(f"\n[ERROR] 步骤「{step_name}」返回非零退出码 {result.returncode}，流程已中止。")
-        sys.exit(result.returncode)
-
 
 def _print_summary() -> None:
     """读取最新候选文件，打印选股摘要。"""
@@ -73,15 +61,12 @@ def _print_summary() -> None:
         print("  暂无符合条件的股票。")
         return
 
-    header = f"{'排名':>4}  {'代码':>8}  {'名称':>8}  {'收盘':>8}  {'J值':>6}  {'均线排列':>6}  {'周线确认':>6}"
+    header = f"{'排名':>4}  {'策略':>14}  {'代码':>8}  {'名称':>8}  {'收盘':>8}  {'Score':>10}"
     print(header)
     print("-" * len(header))
     for i, c in enumerate(candidates, 1):
-        zx  = "Y" if c.get("zx_aligned")     else "N"
-        wma = "Y" if c.get("weekly_aligned")  else "N"
-        print(f"{i:>4}  {c['code']:>8}  {c.get('name', c['code']):>8}  "
-              f"{c.get('close', 0):>8.2f}  {c.get('J', 0):>6.1f}  "
-              f"{zx:>6}  {wma:>6}")
+        print(f"{i:>4}  {c.get('strategy', '-'):>14}  {c['code']:>8}  {c.get('name', c['code']):>8}  "
+              f"{c.get('close', 0):>8.2f}  {c.get('score', 0):>10.4f}")
 
 
 def _choose_data_mode(args: argparse.Namespace) -> str:
@@ -148,6 +133,11 @@ def main() -> None:
         default=None,
         help="数据模式：existing=直接用现有数据，incremental=增量更新，refresh=强制重拉，cache-only=仅用本地缓存",
     )
+    parser.add_argument(
+        "--strategy-id",
+        default=None,
+        help="策略 ID：b1 或 volume_new_high；默认读取配置 active_strategy",
+    )
     args = parser.parse_args()
 
     data_mode = _choose_data_mode(args)
@@ -155,37 +145,32 @@ def main() -> None:
     if data_mode == "existing" and start == 1:
         start = 2
 
-    # ── 步骤 1：拉取 / 更新数据 ───────────────────────────────────────────────
-    if start <= 1:
-        fetch_cmd = [PYTHON, "pipeline/fetch_data.py"]
-        if data_mode == "cache-only":
-            fetch_cmd.append("--use-cache-only")
-        elif data_mode == "refresh":
-            fetch_cmd.append("--force-refresh")
-        _run("步骤 1 / 3  拉取 K 线数据", fetch_cmd)
+    try:
+        run_pipeline(
+            data_mode=data_mode,
+            pick_date=args.pick_date,
+            strategy_id=args.strategy_id,
+            start_from=start,
+            no_dashboard=True,
+        )
+    except Exception as exc:
+        logger.exception("流程执行失败")
+        print(f"\n[ERROR] {exc}")
+        sys.exit(1)
 
-    # ── 步骤 2：量化初选 ──────────────────────────────────────────────────────
     if start <= 2:
-        preselect_cmd = [PYTHON, "pipeline/cli.py", "preselect"]
-        if args.pick_date:
-            preselect_cmd += ["--pick-date", args.pick_date]
-        _run("步骤 2 / 3  B1 量化初选", preselect_cmd)
         _print_summary()
 
-    # ── 步骤 3：启动看盘界面 ──────────────────────────────────────────────────
     if start <= 3 and not args.no_dashboard:
         print(f"\n{'=' * 60}")
-        print("[步骤 3 / 3] 启动 Streamlit 看盘界面")
-        print("  访问地址：http://localhost:8501")
-        print("  按 Ctrl+C 退出看盘界面")
+        print("[步骤 3 / 3] 新版 Vue 控制台")
+        print("  后端：uvicorn backend.app:app --reload")
+        print("  前端：cd web && npm run dev")
+        print("  访问：http://127.0.0.1:5173")
         print(f"{'=' * 60}")
-        subprocess.run(
-            [PYTHON, "-m", "streamlit", "run", "dashboard/app.py"],
-            cwd=str(ROOT),
-        )
     elif args.no_dashboard:
         print("\n[INFO] --no-dashboard 已设置，跳过看盘界面启动。")
-        print("  可手动运行：streamlit run dashboard/app.py")
+        print("  可手动运行 Vue 控制台：cd web && npm run dev")
 
     print(f"\n{'=' * 60}")
     print("全部流程执行完毕！")

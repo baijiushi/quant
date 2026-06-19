@@ -1,0 +1,2 @@
+"""Strategy registry package."""
+

@@ -1,86 +1,204 @@
 # A股量化选股策略系统
 
-当前项目只保留一条主线：
+当前项目主线是 `TUShare -> data/raw -> pipeline -> FastAPI -> Vue`。
 
-- 唯一入口：`run_all.py`
-- 唯一策略：`B1` 策略
-- 唯一数据主线：`TUShare -> data/raw -> pipeline -> dashboard`
+## 功能
 
-## 当前策略
-
-项目当前只保留 `B1` 选股策略，核心条件为：
-
-1. `KDJ` 的 `J` 值处于超卖区
-2. 日线知行均线多头排列
-3. 周线均线多头排列确认
-4. 结合滚动成交额做流动性过滤
-
-策略参数在 [`config/rules_preselect.yaml`](E:\百九十\Desktop\量化选股策略\oversell\config\rules_preselect.yaml) 中维护。
-
-## 项目结构
-
-- [`run_all.py`](E:\百九十\Desktop\量化选股策略\oversell\run_all.py) 一键运行入口
-- [`pipeline/fetch_data.py`](E:\百九十\Desktop\量化选股策略\oversell\pipeline\fetch_data.py) 拉取 / 更新日线数据
-- [`pipeline/cli.py`](E:\百九十\Desktop\量化选股策略\oversell\pipeline\cli.py) Pipeline 命令行入口
-- [`pipeline/select_stock.py`](E:\百九十\Desktop\量化选股策略\oversell\pipeline\select_stock.py) B1 量化初选
-- [`pipeline/Selector.py`](E:\百九十\Desktop\量化选股策略\oversell\pipeline\Selector.py) B1 指标与条件判断
-- [`dashboard/app.py`](E:\百九十\Desktop\量化选股策略\oversell\dashboard\app.py) Streamlit 看盘界面
-- [`data/data_fetcher.py`](E:\百九十\Desktop\量化选股策略\oversell\data\data_fetcher.py) TUShare 数据抓取器
+- `run_all.py` 保留为命令行入口。
+- `backend/app.py` 提供本地 FastAPI 服务。
+- `web/` 提供 Vue 3 + Vite + TypeScript 控制台。
+- 多策略架构支持 `b1` 和 `volume_new_high`，策略通过统一注册表和标准 OHLCV 数据调用。
+- B1 策略支持 KDJ、日线均线多头、周线确认、MACD、成交量过滤、板块过滤。
+- 缩量新高策略实现 `-corr(HIGH, VOLUME, 10) * rank(stddev(HIGH, 10))`，并支持新高窗口、缩量阈值和最低评分参数。
+- 数据模式支持 `existing`、`incremental`、`refresh`、`cache-only`。
+- DeepSeek AI 评分支持赛道景气度分析和候选股“超景气价值投机”评分。
 
 ## 安装
+
+Python 依赖：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 配置 Token
+前端依赖：
 
-请在项目根目录的 [`.env.local`](E:\百九十\Desktop\量化选股策略\oversell\.env.local:1) 中填写：
+```bash
+cd web
+npm install
+```
+
+## Token
+
+在项目根目录的 `.env.local` 中填写：
 
 ```env
 TUSHARE_TOKEN=你的token
+DEEPSEEK_API_KEY=你的DeepSeek API Key
 ```
 
-该文件不会提交到 GitHub。
+`.env.local` 已加入 `.gitignore`，不会提交到 GitHub。
 
-## 运行方式
+## 命令行运行
 
-完整流程：
-
-```bash
-python run_all.py
-```
-
-只运行选股，不启动看板：
+交互式选择数据模式：
 
 ```bash
 python run_all.py --no-dashboard
 ```
 
-跳过数据更新，直接用本地数据选股：
+直接使用本地数据：
 
 ```bash
-python run_all.py --skip-fetch --no-dashboard
+python run_all.py --data-mode existing --no-dashboard
+```
+
+指定策略运行：
+
+```bash
+python run_all.py --data-mode existing --strategy-id b1 --no-dashboard
+python run_all.py --data-mode existing --strategy-id volume_new_high --no-dashboard
+```
+
+增量更新：
+
+```bash
+python run_all.py --data-mode incremental --no-dashboard
+```
+
+强制重拉：
+
+```bash
+python run_all.py --data-mode refresh --no-dashboard
+```
+
+仅使用缓存：
+
+```bash
+python run_all.py --data-mode cache-only --no-dashboard
+```
+
+## 网页控制台
+
+一键开发启动：
+
+```bash
+python start_web.py
+```
+
+Windows 可以直接双击：
+
+```text
+start_console.bat
+```
+
+停止后台服务：
+
+```text
+stop_console.bat
+```
+
+开发模式会同时启动：
+
+- 后端：http://127.0.0.1:8000
+- 前端：http://127.0.0.1:5173
+
+也可以手动启动后端：
+
+```bash
+uvicorn backend.app:app --reload
+```
+
+手动启动前端：
+
+```bash
+cd web
+npm run dev
+```
+
+访问：
+
+```text
+http://127.0.0.1:5173
+```
+
+构建后只启动后端：
+
+```bash
+cd web
+npm run build
+cd ..
+python start_web.py --prod
+```
+
+此时访问：
+
+```text
+http://127.0.0.1:8000
+```
+
+## DeepSeek AI 评分
+
+AI 评分配置位于 `config/ai_scoring.yaml`。评分结果会写入 `data/ai_scoring/`，该目录已加入 `.gitignore`。
+
+赛道景气度输入默认读取：
+
+```text
+data/news_inputs/
+```
+
+可把 Wind、Bloomberg、高盛、摩根士丹利、金十数据等来源中你有权限使用的文本、报告摘要、CSV 或 JSON 放入该目录。`config/ai_scoring.yaml` 也支持配置公开 `source_urls`。付费或登录源不在第一版里硬抓，避免不稳定和合规问题。
+
+命令行运行：
+
+```bash
+python -m ai_scoring.run_ai_scoring --strategy-id b1 --max-candidates 20
+```
+
+Windows 脚本：
+
+```text
+scripts\run_ai_scoring.bat --strategy-id volume_new_high
+```
+
+评分口径：
+
+```text
+最终分数 = ((行业景气度 + 业务纯度 + 估值水位 + 龙头 + 辨识度) - 风险扣分 * 0.2) * 流动性系数 / 5
+```
+
+行业景气度为 0 时，系统要求 AI 给出 `avoid`，即便其他项高分也不作为买入标的。
+
+## 浏览器自动化测试
+
+安装 Playwright 浏览器后运行：
+
+```bash
+cd web
+..\scripts\install_playwright.bat
+cd ..
+scripts\test_browser.bat
 ```
 
 ## 配置文件
 
-- [`config/fetch_data.yaml`](E:\百九十\Desktop\量化选股策略\oversell\config\fetch_data.yaml) 数据拉取配置
-- [`config/rules_preselect.yaml`](E:\百九十\Desktop\量化选股策略\oversell\config\rules_preselect.yaml) B1 策略配置
-- [`config/dashboard.yaml`](E:\百九十\Desktop\量化选股策略\oversell\config\dashboard.yaml) 看板配置
+- `config/fetch_data.yaml`：数据抓取、限频、重试、多线程配置。
+- `config/rules_preselect.yaml`：全局参数、当前激活策略、各策略参数。
+- `data/stocklist.csv`：股票列表缓存。
+- `data/raw/`：个股日线 CSV。
+- `data/candidates/`：候选股结果，包含全局 latest 和按策略区分的 latest。
+- `data/failures/`：抓取失败报告。
 
-## 数据目录
+## API
 
-所有运行数据都固定落在项目根目录下，不再依赖启动命令时的当前工作目录：
-
-- [`data/raw`](E:\百九十\Desktop\量化选股策略\oversell\data\raw:1) 个股日线数据
-- [`data/stocklist.csv`](E:\百九十\Desktop\量化选股策略\oversell\data\stocklist.csv:1) 股票列表
-- [`data/candidates`](E:\百九十\Desktop\量化选股策略\oversell\data\candidates:1) 候选结果
-- [`data/failures`](E:\百九十\Desktop\量化选股策略\oversell\data\failures:1) 抓取失败记录
-
-## 项目规划
-
-后续任务路线见 [`项目任务表.md`](E:\百九十\Desktop\量化选股策略\oversell\项目任务表.md)。
+- `GET /api/strategies`：查看已注册策略和默认参数。
+- `GET /api/config` / `PUT /api/config`：读取或保存全局配置与策略配置。
+- `POST /api/runs`：启动任务，可传 `strategy_id`。
+- `POST /api/runs/{run_id}/cancel`：终止正在运行的任务。
+- `GET /api/candidates/latest?strategy_id=b1`：读取指定策略最新结果。
+- `GET /api/ai/sector-scores/latest` / `POST /api/ai/sector-scores/refresh`：读取或更新赛道景气度评分。
+- `GET /api/ai/candidate-scores/latest` / `POST /api/ai/candidate-scores/score`：读取或生成候选股 AI 评分。
+- `POST /api/backtests` / `GET /api/backtests/{id}`：回测接口已预留，当前返回未实现。
 
 ## 风险提示
 
