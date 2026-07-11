@@ -15,6 +15,7 @@ import pandas as pd
 import tushare as ts
 
 from pipeline.cancellation import RunCancelledError, raise_if_cancelled
+from storage.database import upsert_price_batch, upsert_stocks
 
 logger = logging.getLogger(__name__)
 
@@ -314,6 +315,7 @@ class AStockDataFetcher:
                 cached = pd.read_csv(self.stock_list_file, dtype={"代码": str, "ts_code": str})
                 if not cached.empty and {"代码", "名称"}.issubset(cached.columns):
                     self.stock_list = cached
+                    upsert_stocks(cached)
                     logger.info("从本地股票列表缓存读取成功，共 %d 只", len(cached))
                     return cached
             except Exception as exc:
@@ -334,6 +336,7 @@ class AStockDataFetcher:
             stock_info["代码"] = stock_info["代码"].astype(str).str.zfill(6)
             self.stock_list = stock_info[["代码", "名称", "ts_code", "market", "list_date"]].copy()
             self.stock_list.to_csv(self.stock_list_file, index=False, encoding="utf-8-sig")
+            upsert_stocks(self.stock_list)
             logger.info("股票列表已保存至: %s", self.stock_list_file)
             return self.stock_list
         except Exception as exc:
@@ -549,6 +552,16 @@ class AStockDataFetcher:
                 executor.shutdown(wait=True, cancel_futures=True)
 
         self._save_failure_reports(total)
+        # One batch write after all worker threads complete avoids SQLite lock contention.
+        try:
+            upsert_price_batch(stock_data, adjust)
+            from pipeline.providers import clear_price_cache
+
+            clear_price_cache()
+            logger.info("已同步 %d 只股票的日线数据到 SQLite", len(stock_data))
+        except Exception as exc:  # noqa: BLE001
+            # CSV remains the compatibility cache, so a DB failure must not discard fetched data.
+            logger.warning("同步日线数据到 SQLite 失败，已保留 CSV 缓存: %s", exc)
         logger.info("成功获取 %d/%d 只股票的历史数据", len(stock_data), total)
         with self._state_lock:
             failed_count = len(self.failed_symbols)

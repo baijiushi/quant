@@ -8,3 +8,4 @@ plotly>=5.0.0
 numba>=0.57.0
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
+httpx>=0.27.0

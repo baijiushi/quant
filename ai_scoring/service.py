@@ -10,6 +10,14 @@ from urllib import request
 import yaml
 
 from ai_scoring.client import DeepSeekClient
+from storage.database import (
+    latest_candidate_ai_scores as db_latest_candidate_scores,
+    latest_candidate_run,
+    latest_sector_scores as db_latest_sector_scores,
+    list_research_documents,
+    save_candidate_ai_scores,
+    save_sector_scores,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_FILE = ROOT / "config" / "ai_scoring.yaml"
@@ -64,6 +72,15 @@ def collect_sector_sources() -> list[dict[str, str]]:
     max_chars = int(scoring_cfg.get("max_source_chars", 24000))
     input_dir = _resolve(scoring_cfg.get("news_input_dir", "data/news_inputs"))
     documents = _load_news_inputs(input_dir, max_chars)
+    # Research notes are intentionally explicit inputs: they can contain a video
+    # summary or a licensed report excerpt without pretending that it was scraped.
+    for item in list_research_documents(limit=50):
+        documents.append(
+            {
+                "source": item.get("source_url") or f"research:{item.get('title', 'untitled')}",
+                "content": str(item.get("content", ""))[:max_chars],
+            }
+        )
 
     for url in scoring_cfg.get("source_urls", []) or []:
         try:
@@ -84,6 +101,9 @@ def _client_from_config() -> DeepSeekClient:
 
 
 def latest_sector_scores() -> dict[str, Any]:
+    stored = db_latest_sector_scores()
+    if stored:
+        return stored
     out_dir = _resolve(_read_yaml().get("scoring", {}).get("sector_output_dir", "data/ai_scoring"))
     return _read_json(out_dir / "sector_scores_latest.json")
 
@@ -98,8 +118,10 @@ def refresh_sector_scores(extra_context: str | None = None) -> dict[str, Any]:
         {
             "role": "system",
             "content": (
-                "你是A股超景气赛道研究员。只根据用户提供的资料评分，不要编造未提供的新闻。"
-                "如果证据不足，score必须低于50，并明确写 evidence_gaps。输出严格JSON。"
+                "你是A股超景气赛道研究员。方法论参考超景气价值投机框架："
+                "只在政策拐点、技术突破、订单爆发、供需反转或现象级事件有可核验材料时给高分。"
+                "只根据用户提供的资料评分，不要编造未提供的新闻、机构观点或公司关系。"
+                "证据不足时 score 必须低于 50，并明确写 evidence_gaps 与 source_refs。输出严格JSON。"
             ),
         },
         {
@@ -108,7 +130,7 @@ def refresh_sector_scores(extra_context: str | None = None) -> dict[str, Any]:
                 "请按超景气价值投机模型，识别当前或即将超景气的A股赛道。"
                 "重点关注政策拐点、技术重大突破、突发订单、行业反转、现象级事件。"
                 "输出JSON字段：generated_at, sectors。sectors数组每项包含：sector, score(0-100), "
-                "opportunity_type, catalysts, evidence, source_refs, risk_notes, evidence_gaps。\n"
+                "opportunity_type, catalysts, evidence, source_refs, risk_notes, evidence_gaps, confidence(0-1)。\n"
                 f"额外背景：{extra_context or ''}\n"
                 f"资料：{source_blob}"
             ),
@@ -117,6 +139,8 @@ def refresh_sector_scores(extra_context: str | None = None) -> dict[str, Any]:
     payload = _client_from_config().chat_json(messages)
     payload.setdefault("generated_at", datetime.now().isoformat(timespec="seconds"))
     payload.setdefault("source_count", len(documents))
+    payload.setdefault("methodology", "super-boom-v2")
+    save_sector_scores(payload, documents, model=_read_yaml().get("deepseek", {}).get("model"))
     _write_json(out_dir / "sector_scores_latest.json", payload)
     dated = out_dir / f"sector_scores_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     _write_json(dated, payload)
@@ -124,6 +148,9 @@ def refresh_sector_scores(extra_context: str | None = None) -> dict[str, Any]:
 
 
 def _load_candidate_run(strategy_id: str | None = None) -> dict[str, Any]:
+    stored = latest_candidate_run(strategy_id)
+    if stored:
+        return stored
     if strategy_id:
         path = ROOT / "data" / "candidates" / f"candidates_latest_{strategy_id}.json"
         if path.exists():
@@ -145,6 +172,9 @@ def _load_stocklist_rows(limit_codes: set[str]) -> list[dict[str, str]]:
 
 
 def latest_candidate_ai_scores(strategy_id: str | None = None) -> dict[str, Any]:
+    stored = db_latest_candidate_scores(strategy_id)
+    if stored:
+        return stored
     out_dir = _resolve(_read_yaml().get("scoring", {}).get("candidate_output_dir", "data/ai_scoring"))
     if strategy_id:
         path = out_dir / f"candidate_ai_scores_latest_{strategy_id}.json"
@@ -168,7 +198,8 @@ def score_latest_candidates(strategy_id: str | None = None, max_candidates: int 
             "role": "system",
             "content": (
                 "你是A股超景气价值投机评分员。必须严格按给定公式评分。不要给投资承诺。"
-                "行业景气度为0时，decision必须为avoid。资料不足时降低分数并列出data_needed。输出严格JSON。"
+                "行业景气度为0时，decision必须为avoid。没有证据时不得以常识补全，资料不足时降低分数并列出data_needed。"
+                "每个非零维度必须给 source_refs，输出严格JSON。"
             ),
         },
         {
@@ -177,8 +208,9 @@ def score_latest_candidates(strategy_id: str | None = None, max_candidates: int 
                 "评分表：正向维度为行业景气度、业务纯度、估值水位、细分行业龙头、市场辨识度，均为0-100。"
                 "风险为扣分项，最终分数 = ((五项正向分数求和) - 风险扣分 * 0.2) * 流动性系数 / 5。"
                 "流动性系数：全市场成交额<0.8万亿用0.8，>1.5万亿用1.2，否则1.0；无法判断默认1.0。"
-                "输出JSON字段：generated_at, pick_date, strategy_id, scores。scores每项包含：code, name, industry, "
-                "final_score, decision(buy/watch/avoid), dimension_scores, risk_events, rationale, evidence_gaps, data_needed。\n"
+                "输出JSON字段：generated_at, pick_date, strategy_id, scores。scores每项包含：code, name, industry, sector_match, "
+                "final_score, decision(buy/watch/avoid), dimension_scores(行业景气度/业务纯度/估值水位/细分行业龙头/市场辨识度), "
+                "risk_deduction, liquidity_coefficient, risk_events, rationale, source_refs, evidence_gaps, data_needed。\n"
                 f"候选股：{json.dumps(candidates, ensure_ascii=False)}\n"
                 f"股票列表补充：{json.dumps(stock_rows, ensure_ascii=False)}\n"
                 f"赛道评分：{json.dumps(sector_scores, ensure_ascii=False)}"
@@ -189,6 +221,8 @@ def score_latest_candidates(strategy_id: str | None = None, max_candidates: int 
     payload.setdefault("generated_at", datetime.now().isoformat(timespec="seconds"))
     payload.setdefault("pick_date", candidate_run.get("pick_date"))
     payload.setdefault("strategy_id", strategy_id or candidate_run.get("meta", {}).get("strategy"))
+    payload.setdefault("methodology", "super-boom-v2")
+    save_candidate_ai_scores(payload, model=cfg.get("deepseek", {}).get("model"))
     _write_json(out_dir / "candidate_ai_scores_latest.json", payload)
     resolved_strategy = str(payload.get("strategy_id") or strategy_id or "unknown")
     _write_json(out_dir / f"candidate_ai_scores_latest_{resolved_strategy}.json", payload)

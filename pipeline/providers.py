@@ -10,6 +10,7 @@ from typing import Dict, Optional
 import pandas as pd
 
 from pipeline.pipeline_core import load_price_data
+from storage.database import load_daily_prices, price_data_signature, upsert_price_batch
 
 STANDARD_PRICE_COLUMNS = ["open", "high", "low", "close", "volume", "amount", "turnover", "turnover_n"]
 logger = logging.getLogger(__name__)
@@ -48,7 +49,7 @@ def clear_price_cache() -> None:
 
 @dataclass(frozen=True)
 class LocalCsvProvider:
-    """Read standardized A-share OHLCV data from local CSV cache."""
+    """Read standard OHLCV from SQLite first, falling back to the legacy CSV cache."""
     data_dir: str
     adjust: str = "qfq"
     n_turnover_days: int = 43
@@ -58,7 +59,12 @@ class LocalCsvProvider:
     id: str = "local_csv"
 
     def load(self, symbols: Optional[list[str]] = None) -> Dict[str, pd.DataFrame]:
-        signature = _data_dir_signature(self.data_dir, self.adjust, symbols)
+        db_signature = price_data_signature(self.adjust)
+        signature = (
+            ("sqlite", self.adjust, tuple(sorted(symbols)) if symbols else None, *db_signature)
+            if db_signature[0]
+            else _data_dir_signature(self.data_dir, self.adjust, symbols)
+        )
         cache_key = signature + (int(self.n_turnover_days),)
         with _PRICE_CACHE_LOCK:
             cached = _PRICE_CACHE.get(cache_key)
@@ -66,14 +72,25 @@ class LocalCsvProvider:
             logger.info("复用进程内 OHLCV 缓存：%d 只，data_dir=%s", len(cached), self.data_dir)
             return dict(cached)
 
-        data = load_price_data(
-            self.data_dir,
-            adjust=self.adjust,
-            symbols=symbols,
-            n_turnover_days=self.n_turnover_days,
-            max_workers=self.max_workers,
-            stop_event=self.stop_event,
-        )
+        data = load_daily_prices(self.adjust, self.n_turnover_days, symbols) if db_signature[0] else {}
+        if data:
+            logger.info("从 SQLite 加载标准 OHLCV 数据：%d 只", len(data))
+        else:
+            data = load_price_data(
+                self.data_dir,
+                adjust=self.adjust,
+                symbols=symbols,
+                n_turnover_days=self.n_turnover_days,
+                max_workers=self.max_workers,
+                stop_event=self.stop_event,
+            )
+            logger.info("SQLite 暂无日线数据，回退读取 CSV：%d 只", len(data))
+            if data:
+                try:
+                    upsert_price_batch(data, self.adjust)
+                    logger.info("已将 CSV 缓存迁移到 SQLite：%d 只", len(data))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("CSV 缓存迁移到 SQLite 失败，本次继续使用 CSV: %s", exc)
         with _PRICE_CACHE_LOCK:
             _PRICE_CACHE[cache_key] = data
             while len(_PRICE_CACHE) > _PRICE_CACHE_MAX_ENTRIES:

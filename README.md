@@ -12,6 +12,7 @@
 - 缩量新高策略实现 `-corr(HIGH, VOLUME, 10) * rank(stddev(HIGH, 10))`，并支持新高窗口、缩量阈值和最低评分参数。
 - 数据模式支持 `existing`、`incremental`、`refresh`、`cache-only`。
 - DeepSeek AI 评分支持赛道景气度分析和候选股“超景气价值投机”评分。
+- SQLite 会保存股票列表、TUShare 日线、任务记录、候选结果、AI 评分和研究素材；CSV/YAML 保留为缓存与可编辑配置。
 
 ## 安装
 
@@ -169,6 +170,22 @@ scripts\run_ai_scoring.bat --strategy-id volume_new_high
 
 行业景气度为 0 时，系统要求 AI 给出 `avoid`，即便其他项高分也不作为买入标的。
 
+### 研究素材与证据链
+
+控制台的“赛道研究素材库”用于保存你已经核对过的视频总结、动态摘录、公告或研报摘要。保存后点击“更新赛道景气度”，这些内容会作为 AI 的显式输入并随评分记录留存。系统不会声称自动读取登录/付费来源，也不会在证据不足时把赛道评为高景气。
+
+“超景气价值投机”评分依据行业景气度、业务纯度、估值水位、细分龙头、市场辨识度和风险扣分；每个非零维度要求 AI 在结果中列出来源引用。AI 结果只用于研究，不构成投资建议。
+
+## SQLite 数据库
+
+数据库文件为 `data/oversell.db`，已加入 `.gitignore`。首次升级可运行一次迁移：
+
+```bash
+python scripts/migrate_to_sqlite.py
+```
+
+本次迁移已安全完成。之后 TUShare 增量获取会自动按“股票代码 + 复权方式 + 交易日”写入数据库，策略优先从 SQLite 加载行情；CSV 仍保留为兼容回退。
+
 ## 浏览器自动化测试
 
 安装 Playwright 浏览器后运行：
@@ -198,6 +215,7 @@ scripts\test_browser.bat
 - `GET /api/candidates/latest?strategy_id=b1`：读取指定策略最新结果。
 - `GET /api/ai/sector-scores/latest` / `POST /api/ai/sector-scores/refresh`：读取或更新赛道景气度评分。
 - `GET /api/ai/candidate-scores/latest` / `POST /api/ai/candidate-scores/score`：读取或生成候选股 AI 评分。
+- `GET` / `POST` / `DELETE /api/research/documents`：管理 AI 赛道评分使用的研究素材。
 - `POST /api/backtests` / `GET /api/backtests/{id}`：回测接口已预留，当前返回未实现。
 
 ## 风险提示

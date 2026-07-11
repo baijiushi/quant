@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from pipeline.schemas import CandidateRun
+from storage.database import save_candidate_run
 
 logger = logging.getLogger(__name__)
 _ROOT = Path(__file__).resolve().parent.parent
@@ -42,6 +43,12 @@ def save_candidates(run: CandidateRun, output_dir: str) -> Path:
     latest_file.write_text(payload, encoding="utf-8")
     strategy_latest_file = out / f"candidates_latest_{strategy_id}.json"
     strategy_latest_file.write_text(payload, encoding="utf-8")
+
+    try:
+        save_candidate_run(run.to_dict())
+    except Exception as exc:  # noqa: BLE001
+        # JSON remains a readable compatibility export even if the local DB is unavailable.
+        logger.warning("候选结果写入 SQLite 失败，已保留 JSON: %s", exc)
 
     logger.info("候选结果已保存：%s（共 %d 只）", dated_file, len(run.candidates))
     return dated_file

@@ -86,6 +86,19 @@ interface CandidateAIScore {
   risk_events?: string[] | string;
   rationale?: string;
   evidence_gaps?: string[] | string;
+  source_refs?: string[] | string;
+  risk_deduction?: number;
+  liquidity_coefficient?: number;
+}
+
+interface ResearchDocument {
+  id: number;
+  title: string;
+  content: string;
+  source_url?: string | null;
+  source_type: string;
+  captured_at: string;
+  created_at: string;
 }
 
 const marketOptions: Array<{ value: Market; label: string }> = [
@@ -112,6 +125,11 @@ const aiSectorScores = ref<Record<string, unknown> | null>(null);
 const aiCandidateScores = ref<Record<string, unknown> | null>(null);
 const aiLoading = ref(false);
 const aiError = ref("");
+const researchDocuments = ref<ResearchDocument[]>([]);
+const researchTitle = ref("");
+const researchContent = ref("");
+const researchUrl = ref("");
+const researchSaving = ref(false);
 let pollTimer: number | null = null;
 let chartResizeObserver: ResizeObserver | null = null;
 
@@ -164,6 +182,16 @@ const activeStrategy = computed(() => config.value?.active_strategy ?? "b1");
 const activeStrategyInfo = computed(() => strategies.value.find((item) => item.id === activeStrategy.value));
 const sectorScoreRows = computed(() => (aiSectorScores.value?.sectors ?? []) as SectorAIScore[]);
 const candidateScoreRows = computed(() => (aiCandidateScores.value?.scores ?? []) as CandidateAIScore[]);
+const runProgress = computed(() => {
+  const stage = runStatus.value?.stage ?? "";
+  if (["运行完成", "已终止", "运行失败", "服务重启中断"].includes(stage)) return 100;
+  if (stage.includes("保存")) return 92;
+  if (stage.includes("策略")) return 75;
+  if (stage.includes("流动性")) return 58;
+  if (stage.includes("加载")) return 38;
+  if (stage.includes("更新") || stage.includes("数据")) return 20;
+  return isRunning.value ? 8 : 0;
+});
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -246,6 +274,56 @@ async function loadAiScores() {
     aiCandidateScores.value = await api<Record<string, unknown>>(`/api/ai/candidate-scores/latest${suffix}`);
   } catch {
     aiCandidateScores.value = { generated_at: null, scores: [] };
+  }
+}
+
+async function loadResearchDocuments() {
+  try {
+    const payload = await api<{ documents: ResearchDocument[] }>("/api/research/documents?limit=20");
+    researchDocuments.value = payload.documents;
+  } catch {
+    researchDocuments.value = [];
+  }
+}
+
+async function saveResearchDocument() {
+  if (!researchTitle.value.trim() || !researchContent.value.trim()) {
+    aiError.value = "请填写研究素材标题和摘要内容。";
+    return;
+  }
+  researchSaving.value = true;
+  aiError.value = "";
+  try {
+    await api<ResearchDocument>("/api/research/documents", {
+      method: "POST",
+      body: JSON.stringify({
+        title: researchTitle.value.trim(),
+        content: researchContent.value.trim(),
+        source_url: researchUrl.value.trim() || null,
+        source_type: "manual_summary"
+      })
+    });
+    researchTitle.value = "";
+    researchContent.value = "";
+    researchUrl.value = "";
+    await loadResearchDocuments();
+    message.value = "研究素材已保存，下次更新赛道评分会自动纳入。";
+  } catch (error) {
+    aiError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    researchSaving.value = false;
+  }
+}
+
+async function deleteResearchDocument(documentId: number) {
+  researchSaving.value = true;
+  try {
+    await api<{ deleted: boolean }>(`/api/research/documents/${documentId}`, { method: "DELETE" });
+    await loadResearchDocuments();
+  } catch (error) {
+    aiError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    researchSaving.value = false;
   }
 }
 
@@ -585,6 +663,15 @@ function decisionLabel(value: unknown): string {
   return String(value ?? "-");
 }
 
+function statusLabel(value: RunStatus["status"] | undefined): string {
+  return ({ queued: "排队中", running: "运行中", cancelling: "正在终止", success: "已完成", failed: "运行失败", cancelled: "已终止" } as Record<string, string>)[value ?? ""] ?? "空闲";
+}
+
+function sourceCountLabel(item: CandidateAIScore): string {
+  const refs = item.source_refs;
+  return Array.isArray(refs) ? `${refs.length} 条证据` : refs ? "有证据" : "待补充";
+}
+
 watch(selectedCode, async (code) => {
   if (code) {
     await loadKline(code);
@@ -613,6 +700,7 @@ onMounted(async () => {
       await loadKline(selectedCode.value);
     }
     await loadAiScores();
+    await loadResearchDocuments();
   } catch (error) {
     bootError.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -646,6 +734,7 @@ onUnmounted(() => {
         <span>模式 {{ config?.data_mode ?? "-" }}</span>
         <span>策略 {{ activeStrategyInfo?.name ?? activeStrategy }}</span>
         <span>日期 {{ latest?.pick_date ?? "-" }}</span>
+        <span>存储 SQLite</span>
       </div>
     </section>
 
@@ -882,10 +971,21 @@ onUnmounted(() => {
           </div>
         </div>
           <div v-if="runStatus" class="status-row">
-            <strong>状态：{{ runStatus.status }}</strong>
+            <strong>状态：{{ statusLabel(runStatus.status) }}</strong>
             <span>任务：{{ runStatus.run_id }}</span>
             <span>开始：{{ runStatus.started_at ?? "-" }}</span>
             <span>结束：{{ runStatus.finished_at ?? "-" }}</span>
+          </div>
+          <div v-if="runStatus" class="progress-wrap" :aria-label="`当前进度 ${runProgress}%`">
+            <div class="progress-meta"><span>{{ runStatus.stage }}</span><strong>{{ runProgress }}%</strong></div>
+            <div class="progress-track"><i :style="{ width: `${runProgress}%` }"></i></div>
+            <div class="run-steps">
+              <span :class="{ done: runProgress >= 20 }">数据</span>
+              <span :class="{ done: runProgress >= 38 }">加载</span>
+              <span :class="{ done: runProgress >= 58 }">流动性</span>
+              <span :class="{ done: runProgress >= 75 }">策略</span>
+              <span :class="{ done: runProgress >= 92 }">结果</span>
+            </div>
           </div>
           <pre v-if="runLogs.length" class="terminal">{{ runLogs.join("\n") }}</pre>
           <p v-if="runStatus?.error" class="error">{{ runStatus.error }}</p>
@@ -996,6 +1096,7 @@ onUnmounted(() => {
                       <th>行业</th>
                       <th>分数</th>
                       <th>结论</th>
+                      <th>证据</th>
                       <th>理由</th>
                     </tr>
                   </thead>
@@ -1006,15 +1107,61 @@ onUnmounted(() => {
                       <td>{{ item.industry ?? "-" }}</td>
                       <td>{{ Number(item.final_score ?? 0).toFixed(1) }}</td>
                       <td>{{ decisionLabel(item.decision) }}</td>
+                      <td>{{ sourceCountLabel(item) }}</td>
                       <td>{{ item.rationale ?? aiListText(item.evidence_gaps) }}</td>
                     </tr>
                     <tr v-if="!candidateScoreRows.length">
-                      <td colspan="6" class="empty-cell">暂无个股 AI 评分</td>
+                      <td colspan="7" class="empty-cell">暂无个股 AI 评分</td>
                     </tr>
                   </tbody>
                 </table>
               </div>
             </section>
+          </div>
+          <div v-if="candidateScoreRows.length" class="ai-detail-list">
+            <details v-for="item in candidateScoreRows" :key="`${item.code}-detail`">
+              <summary>{{ item.code }} {{ item.name }} 的评分明细</summary>
+              <p><strong>五维评分：</strong>{{ JSON.stringify(item.dimension_scores ?? {}) }}</p>
+              <p><strong>风险扣分：</strong>{{ item.risk_deduction ?? "-" }}，<strong>流动性系数：</strong>{{ item.liquidity_coefficient ?? "-" }}</p>
+              <p><strong>来源：</strong>{{ aiListText(item.source_refs) }}</p>
+              <p><strong>待补充：</strong>{{ aiListText(item.evidence_gaps) }}</p>
+            </details>
+          </div>
+        </div>
+
+        <div class="panel research-panel">
+          <div class="panel-title">
+            <div>
+              <h2>赛道研究素材库</h2>
+              <p class="hint">录入你对视频、动态、公告或研报的摘要。AI 仅把这些文字作为证据，不会假装已读取付费内容。</p>
+            </div>
+            <span class="stage-badge">已存 {{ researchDocuments.length }} 条</span>
+          </div>
+          <div class="research-grid">
+            <label class="field">
+              <span>素材标题</span>
+              <input v-model="researchTitle" placeholder="例：笨笨的韭菜 7 月市场记录摘要" />
+            </label>
+            <label class="field">
+              <span>来源链接（可选）</span>
+              <input v-model="researchUrl" type="url" placeholder="https://www.bilibili.com/..." />
+            </label>
+          </div>
+          <label class="field">
+            <span>研究摘要与原始要点</span>
+            <textarea v-model="researchContent" rows="6" placeholder="写明日期、赛道、政策/订单/技术催化、对应公司、反证和风险。保存后点击“更新赛道景气度”即可纳入评分。"></textarea>
+          </label>
+          <button :disabled="researchSaving" @click="saveResearchDocument">{{ researchSaving ? "保存中" : "保存研究素材" }}</button>
+          <div class="research-list">
+            <article v-for="item in researchDocuments" :key="item.id">
+              <div><strong>{{ item.title }}</strong><span>{{ item.captured_at }}</span></div>
+              <p>{{ item.content }}</p>
+              <div class="research-actions">
+                <a v-if="item.source_url" :href="item.source_url" target="_blank" rel="noreferrer">查看来源</a>
+                <button class="text-button" :disabled="researchSaving" @click="deleteResearchDocument(item.id)">删除</button>
+              </div>
+            </article>
+            <p v-if="!researchDocuments.length" class="empty-cell">暂无研究素材。先保存一条经过你核对的摘要，再运行赛道评分。</p>
           </div>
         </div>
 

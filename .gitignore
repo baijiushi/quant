@@ -43,6 +43,8 @@ data/failures/
 data/ai_scoring/
 data/news_inputs/
 data/stocklist.csv
+data/oversell.db
+data/oversell.db-*
 
 # Frontend
 web/node_modules/

@@ -1,4 +1,4 @@
-active_strategy: b1
+active_strategy: volume_new_high
 global:
   data_dir: data/raw
   stock_list_file: data/stocklist.csv

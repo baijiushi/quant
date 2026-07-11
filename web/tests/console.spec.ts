@@ -40,7 +40,7 @@ test("console restores active run after reopening the page", async ({ page }) =>
 
   await page.goto("/");
 
-  await expect(page.getByText("策略筛选")).toBeVisible();
+  await expect(page.locator(".status .stage-badge")).toHaveText("策略筛选");
   await expect(page.getByText("任务：active123")).toBeVisible();
   await expect(page.getByText("检测到后台任务正在运行，已恢复任务状态")).toBeVisible();
   await expect(page.getByText("B1选股进度 250/2000")).toBeVisible();
@@ -94,6 +94,20 @@ test("console can request run cancellation", async ({ page }) => {
   await expect(page.getByRole("button", { name: "终止任务" })).toBeVisible();
   await page.getByRole("button", { name: "终止任务" }).click();
   expect(cancelRequested).toBeTruthy();
-  await expect(page.getByText("正在终止")).toBeVisible();
+  await expect(page.locator(".status .stage-badge")).toHaveText("正在终止");
   await expect(page.getByText("已发送终止请求，等待当前步骤安全退出")).toBeVisible();
+});
+
+test("console can save and delete a research evidence note", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByLabel("素材标题").fill("浏览器回归测试素材");
+  await page.getByLabel("研究摘要与原始要点").fill("这是自动化测试素材，会在本测试结束前删除。");
+  await page.getByRole("button", { name: "保存研究素材" }).click();
+
+  await expect(page.getByText("研究素材已保存，下次更新赛道评分会自动纳入。")).toBeVisible();
+  await expect(page.getByText("浏览器回归测试素材")).toBeVisible();
+
+  await page.getByRole("button", { name: "删除" }).click();
+  await expect(page.getByText("浏览器回归测试素材")).not.toBeVisible();
 });

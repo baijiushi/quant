@@ -26,6 +26,18 @@ from pipeline.cancellation import RunCancelledError
 from pipeline.runtime import DATA_MODES, run_pipeline
 from pipeline.select_stock import normalize_strategy_config
 from strategies.registry import list_strategies
+from storage.database import (
+    get_current_pipeline_run as db_current_run,
+    get_pipeline_run as db_get_run,
+    init_db,
+    latest_candidate_run as db_latest_candidates,
+    load_daily_prices,
+    load_stocks,
+    mark_interrupted_runs,
+    save_research_document,
+    delete_research_document,
+    upsert_pipeline_run,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 FETCH_CONFIG = ROOT / "config" / "fetch_data.yaml"
@@ -88,9 +100,23 @@ class CandidateAIScoreRequest(BaseModel):
     max_candidates: int | None = None
 
 
+class ResearchDocumentRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1, max_length=100_000)
+    source_url: str | None = Field(default=None, max_length=2_000)
+    source_type: str = Field(default="manual", max_length=40)
+    captured_at: str | None = None
+
+
 _runs: dict[str, RunStatus] = {}
 _run_cancel_events: dict[str, threading.Event] = {}
 _runs_lock = threading.Lock()
+
+
+@app.on_event("startup")
+def initialize_local_store() -> None:
+    init_db()
+    mark_interrupted_runs()
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -147,6 +173,7 @@ def _append_run_log(run_id: str, message: str) -> None:
             status.logs.append(f"{datetime.now().strftime('%H:%M:%S')} {message}")
             if len(status.logs) > 400:
                 status.logs = status.logs[-400:]
+            upsert_pipeline_run(status.model_dump() if hasattr(status, "model_dump") else status.dict())
 
 
 def _set_run_status(run_id: str, **updates: Any) -> None:
@@ -154,6 +181,7 @@ def _set_run_status(run_id: str, **updates: Any) -> None:
         old = _runs[run_id]
         current = old.model_copy(update=updates) if hasattr(old, "model_copy") else old.copy(update=updates)
         _runs[run_id] = current
+        upsert_pipeline_run(current.model_dump() if hasattr(current, "model_dump") else current.dict())
 
 
 def _get_current_run_locked() -> RunStatus | None:
@@ -314,6 +342,10 @@ def create_run(request: RunRequest) -> RunStatus:
     with _runs_lock:
         _runs[run_id] = status
         _run_cancel_events[run_id] = threading.Event()
+        upsert_pipeline_run(
+            status.model_dump() if hasattr(status, "model_dump") else status.dict(),
+            request.model_dump(by_alias=True) if hasattr(request, "model_dump") else request.dict(by_alias=True),
+        )
 
     thread = threading.Thread(target=_run_background, args=(run_id, request), daemon=True)
     thread.start()
@@ -343,6 +375,9 @@ def cancel_run(run_id: str) -> RunStatus:
 def get_current_run() -> CurrentRunResponse:
     with _runs_lock:
         status = _get_current_run_locked()
+    if status is None:
+        stored = db_current_run()
+        status = RunStatus(**stored) if stored else None
     return CurrentRunResponse(run=status)
 
 
@@ -351,12 +386,18 @@ def get_run(run_id: str) -> RunStatus:
     with _runs_lock:
         status = _runs.get(run_id)
     if status is None:
+        stored = db_get_run(run_id)
+        status = RunStatus(**stored) if stored else None
+    if status is None:
         raise HTTPException(status_code=404, detail="run not found")
     return status
 
 
 @app.get("/api/candidates/latest")
 def get_latest_candidates(strategy_id: str | None = None) -> dict[str, Any]:
+    stored = db_latest_candidates(strategy_id)
+    if stored:
+        return stored
     if strategy_id:
         path = ROOT / "data" / "candidates" / f"candidates_latest_{strategy_id}.json"
         if path.exists():
@@ -390,6 +431,9 @@ def get_latest_failures() -> dict[str, Any]:
 
 @app.get("/api/stocks")
 def get_stocks() -> dict[str, Any]:
+    database_rows = load_stocks()
+    if not database_rows.empty:
+        return {"stocks": database_rows.fillna("").to_dict(orient="records")}
     path = ROOT / "data" / "stocklist.csv"
     if not path.exists():
         return {"stocks": []}
@@ -401,6 +445,15 @@ def get_stocks() -> dict[str, Any]:
 @app.get("/api/stocks/{code}/kline")
 def get_stock_kline(code: str, adjust: str = "qfq", limit: int = 180) -> dict[str, Any]:
     safe_code = str(code).zfill(6)
+    database_data = load_daily_prices(adjust, 1, [safe_code])
+    if database_data.get(safe_code) is not None:
+        df = database_data[safe_code].copy()
+        df.index.name = "date"
+        df = df.reset_index()
+        keep = [c for c in ["date", "open", "close", "high", "low", "volume", "amount"] if c in df.columns]
+        df = df[keep].tail(max(1, min(limit, 1000))).copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        return {"code": safe_code, "rows": df.fillna(0).to_dict(orient="records")}
     path = ROOT / "data" / "raw" / f"{safe_code}_{adjust}.csv"
     if not path.exists():
         raise HTTPException(status_code=404, detail="kline file not found")
@@ -463,6 +516,24 @@ def post_score_candidates(request: CandidateAIScoreRequest) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.exception("AI candidate scoring failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/research/documents")
+def get_research_documents(limit: int = 30) -> dict[str, Any]:
+    from storage.database import list_research_documents
+
+    return {"documents": list_research_documents(limit)}
+
+
+@app.post("/api/research/documents")
+def post_research_document(request: ResearchDocumentRequest) -> dict[str, Any]:
+    """Store a licensed excerpt or the user's own summary as AI-score evidence."""
+    return save_research_document(request.model_dump())
+
+
+@app.delete("/api/research/documents/{document_id}")
+def remove_research_document(document_id: int) -> dict[str, bool]:
+    return {"deleted": delete_research_document(document_id)}
 
 
 if WEB_DIST.exists():
