@@ -7,3 +7,4 @@ data:
   second_pass_enabled: true
   second_pass_sleep_seconds: 8
   max_workers: 6
+  bulk_incremental_enabled: true

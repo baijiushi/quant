@@ -6,6 +6,7 @@ SQLite stores generated records that need history, querying and restart recovery
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,15 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = ROOT / "data" / "oversell.db"
+logger = logging.getLogger(__name__)
+
+
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 def _json(value: Any) -> str:
@@ -32,8 +42,9 @@ def _decode(value: str | None, fallback: Any) -> Any:
 
 def _connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn = sqlite3.connect(DB_PATH, timeout=30, factory=_ClosingConnection)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
@@ -93,6 +104,27 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_research_documents_created ON research_documents(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS knowledge_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                knowledge_id TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_url TEXT,
+                source_type TEXT NOT NULL,
+                evidence_level TEXT NOT NULL DEFAULT 'secondary',
+                published_at TEXT,
+                captured_at TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(knowledge_id, source_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_knowledge_documents_latest
+                ON knowledge_documents(knowledge_id, active, published_at DESC, updated_at DESC);
 
             CREATE TABLE IF NOT EXISTS sector_score_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -299,6 +331,107 @@ def _research_row(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in ["id", "title", "content", "source_url", "source_type", "captured_at", "created_at"]}
 
 
+def upsert_knowledge_documents(documents: list[dict[str, Any]]) -> int:
+    """Store versioned research evidence without duplicating periodic fetches."""
+    if not documents:
+        return 0
+    init_db()
+    now = datetime.now().isoformat(timespec="seconds")
+    rows = []
+    for item in documents:
+        knowledge_id = str(item.get("knowledge_id", "")).strip()
+        source_key = str(item.get("source_key", "")).strip()
+        if not knowledge_id or not source_key:
+            raise ValueError("knowledge_id and source_key are required")
+        rows.append(
+            (
+                knowledge_id,
+                source_key,
+                str(item.get("title") or "未命名知识条目"),
+                str(item.get("content") or ""),
+                item.get("source_url"),
+                str(item.get("source_type") or "manual"),
+                str(item.get("evidence_level") or "secondary"),
+                item.get("published_at"),
+                str(item.get("captured_at") or now),
+                str(item.get("content_hash") or ""),
+                _json(item.get("metadata", {})),
+                1 if item.get("active", True) else 0,
+                now,
+                now,
+            )
+        )
+    with _connect() as conn:
+        conn.executemany(
+            """INSERT INTO knowledge_documents(
+                   knowledge_id,source_key,title,content,source_url,source_type,evidence_level,
+                   published_at,captured_at,content_hash,metadata_json,active,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(knowledge_id,source_key) DO UPDATE SET
+                   title=excluded.title,content=excluded.content,source_url=excluded.source_url,
+                   source_type=excluded.source_type,evidence_level=excluded.evidence_level,
+                   published_at=excluded.published_at,captured_at=excluded.captured_at,
+                   content_hash=excluded.content_hash,metadata_json=excluded.metadata_json,
+                   active=excluded.active,updated_at=excluded.updated_at""",
+            rows,
+        )
+    return len(rows)
+
+
+def list_knowledge_documents(knowledge_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    init_db()
+    safe_limit = max(1, min(int(limit), 500))
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT * FROM knowledge_documents
+               WHERE knowledge_id=? AND active=1
+               ORDER BY COALESCE(published_at, captured_at) DESC, updated_at DESC
+               LIMIT ?""",
+            (knowledge_id, safe_limit),
+        ).fetchall()
+    return [_knowledge_row(row) for row in rows]
+
+
+def knowledge_document_status(knowledge_id: str) -> dict[str, Any]:
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) AS document_count, MAX(captured_at) AS last_captured_at,
+                      MAX(CASE WHEN source_type='bilibili_catalog' THEN captured_at END) AS last_public_refresh_at,
+                      MAX(updated_at) AS last_updated_at, MAX(published_at) AS latest_published_at
+               FROM knowledge_documents WHERE knowledge_id=? AND active=1""",
+            (knowledge_id,),
+        ).fetchone()
+    return {
+        "knowledge_id": knowledge_id,
+        "document_count": int(row["document_count"] or 0),
+        "last_captured_at": row["last_captured_at"],
+        "last_public_refresh_at": row["last_public_refresh_at"],
+        "last_updated_at": row["last_updated_at"],
+        "latest_published_at": row["latest_published_at"],
+    }
+
+
+def _knowledge_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "knowledge_id": row["knowledge_id"],
+        "source_key": row["source_key"],
+        "title": row["title"],
+        "content": row["content"],
+        "source_url": row["source_url"],
+        "source_type": row["source_type"],
+        "evidence_level": row["evidence_level"],
+        "published_at": row["published_at"],
+        "captured_at": row["captured_at"],
+        "content_hash": row["content_hash"],
+        "metadata": _decode(row["metadata_json"], {}),
+        "active": bool(row["active"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 def save_sector_scores(payload: dict[str, Any], sources: list[dict[str, Any]], model: str | None = None) -> None:
     init_db()
     with _connect() as conn:
@@ -306,7 +439,7 @@ def save_sector_scores(payload: dict[str, Any], sources: list[dict[str, Any]], m
             """INSERT INTO sector_score_runs(generated_at,model,methodology_version,source_count,sources_json,payload_json)
                VALUES(?,?,?,?,?,?)""",
             (payload.get("generated_at") or datetime.now().isoformat(timespec="seconds"), model,
-             "super-boom-v2", len(sources), _json(sources), _json(payload)),
+             payload.get("methodology", "super-boom-v2"), len(sources), _json(sources), _json(payload)),
         )
 
 
@@ -330,7 +463,7 @@ def save_candidate_ai_scores(payload: dict[str, Any], model: str | None = None) 
             """INSERT INTO candidate_ai_score_runs(generated_at,strategy_id,pick_date,model,methodology_version,payload_json)
                VALUES(?,?,?,?,?,?)""",
             (payload.get("generated_at") or datetime.now().isoformat(timespec="seconds"), payload.get("strategy_id"),
-             payload.get("pick_date"), model, "super-boom-v2", _json(payload)),
+             payload.get("pick_date"), model, payload.get("methodology", "super-boom-v2"), _json(payload)),
         )
 
 
@@ -421,11 +554,45 @@ def upsert_daily_prices(code: str, adjust: str, frame: pd.DataFrame) -> None:
 def upsert_price_batch(prices: dict[str, pd.DataFrame], adjust: str) -> None:
     init_db()
     now = datetime.now().isoformat(timespec="seconds")
+    items = list(prices.items())
+    total = len(items)
+    chunk_size = 250
+    for offset in range(0, total, chunk_size):
+        chunk = items[offset : offset + chunk_size]
+        with _connect() as conn:
+            for code, frame in chunk:
+                rows = _price_rows(code, adjust, frame, now)
+                if rows:
+                    conn.executemany(_UPSERT_PRICE_SQL, rows)
+        # The run log handler writes pipeline status to the same database, so log
+        # only after the price transaction has committed and released its lock.
+        logger.info("SQLite 行情同步进度 %d/%d", min(offset + len(chunk), total), total)
+
+
+def price_codes(adjust: str) -> set[str]:
+    init_db()
     with _connect() as conn:
-        for code, frame in prices.items():
-            rows = _price_rows(code, adjust, frame, now)
-            if rows:
-                conn.executemany(_UPSERT_PRICE_SQL, rows)
+        rows = conn.execute("SELECT DISTINCT code FROM daily_prices WHERE adjust=?", (adjust or "bfq",)).fetchall()
+    return {str(row["code"]).zfill(6) for row in rows}
+
+
+def rescale_qfq_history(ratios: dict[str, float], before_date: str) -> int:
+    """Rebase cached qfq OHLC after the latest adjustment factor changes."""
+    effective = {code: ratio for code, ratio in ratios.items() if abs(float(ratio) - 1.0) > 1e-10}
+    if not effective:
+        return 0
+    init_db()
+    updated = 0
+    with _connect() as conn:
+        for code, ratio in effective.items():
+            cur = conn.execute(
+                """UPDATE daily_prices SET open=open*?, high=high*?, low=low*?, close=close*?, updated_at=?
+                   WHERE code=? AND adjust='qfq' AND trade_date<=?""",
+                (ratio, ratio, ratio, ratio, datetime.now().isoformat(timespec="seconds"), code, before_date),
+            )
+            updated += int(cur.rowcount or 0)
+    logger.info("前复权基准更新：%d 只股票，重标 %d 条历史行情", len(effective), updated)
+    return updated
 
 
 def price_data_signature(adjust: str) -> tuple[int, str | None, str | None]:
@@ -438,6 +605,38 @@ def price_data_signature(adjust: str) -> tuple[int, str | None, str | None]:
     return int(row["total"] or 0), row["latest_date"], row["updated_at"]
 
 
+def market_turnover_snapshot(adjust: str = "qfq", trade_date: str | None = None) -> dict[str, Any]:
+    """Return full-market turnover and the scoring coefficient for one trading day."""
+    init_db()
+    with _connect() as conn:
+        resolved_date = trade_date
+        if resolved_date:
+            row = conn.execute(
+                "SELECT MAX(trade_date) AS trade_date FROM daily_prices WHERE adjust=? AND trade_date<=?",
+                (adjust or "qfq", resolved_date),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT MAX(trade_date) AS trade_date FROM daily_prices WHERE adjust=?",
+                (adjust or "qfq",),
+            ).fetchone()
+        resolved_date = row["trade_date"] if row else None
+        if not resolved_date:
+            return {"trade_date": None, "amount_trillion": None, "coefficient": 1.0}
+        amount_row = conn.execute(
+            "SELECT SUM(amount) AS total_amount FROM daily_prices WHERE adjust=? AND trade_date=?",
+            (adjust or "qfq", resolved_date),
+        ).fetchone()
+    # TUShare daily.amount is expressed in thousands of CNY.
+    amount_trillion = float(amount_row["total_amount"] or 0) / 1_000_000_000
+    coefficient = 0.8 if amount_trillion < 0.8 else 1.2 if amount_trillion > 1.5 else 1.0
+    return {
+        "trade_date": resolved_date,
+        "amount_trillion": round(amount_trillion, 4),
+        "coefficient": coefficient,
+    }
+
+
 def load_daily_prices(adjust: str, n_turnover_days: int, symbols: list[str] | None = None) -> dict[str, pd.DataFrame]:
     """Read normalized OHLCV data for strategies, including the derived turnover_n column."""
     init_db()
@@ -448,17 +647,22 @@ def load_daily_prices(adjust: str, n_turnover_days: int, symbols: list[str] | No
         clauses.append(f"code IN ({','.join('?' for _ in codes)})")
         params.extend(codes)
     query = "SELECT * FROM daily_prices WHERE " + " AND ".join(clauses) + " ORDER BY code, trade_date"
+    logger.info("SQLite 开始读取标准行情，adjust=%s", adjust)
     with _connect() as conn:
-        rows = conn.execute(query, params).fetchall()
-    if not rows:
+        frame = pd.read_sql_query(query, conn, params=params)
+    if frame.empty:
         return {}
-    frame = pd.DataFrame([dict(row) for row in rows])
+    logger.info("SQLite 已读取 %d 行行情，开始按股票整理", len(frame))
     result: dict[str, pd.DataFrame] = {}
-    for code, group in frame.groupby("code", sort=False):
+    grouped = frame.groupby("code", sort=False)
+    total = frame["code"].nunique()
+    for index, (code, group) in enumerate(grouped, 1):
         group = group.copy()
         group.index = pd.to_datetime(group.pop("trade_date"), errors="coerce")
         group = group.drop(columns=["code", "adjust", "updated_at"], errors="ignore")
         group = group.rename(columns={"change_value": "change"})
         group["turnover_n"] = group["amount"].rolling(max(1, int(n_turnover_days)), min_periods=1).sum()
         result[str(code).zfill(6)] = group
+        if index % 500 == 0 or index == total:
+            logger.info("SQLite 行情整理进度 %d/%d", index, total)
     return result

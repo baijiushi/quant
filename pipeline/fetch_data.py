@@ -68,6 +68,7 @@ def run(
     second_pass_enabled = bool(data_cfg.get("second_pass_enabled", True))
     second_pass_sleep_seconds = int(data_cfg.get("second_pass_sleep_seconds", 8))
     max_workers = int(data_cfg.get("max_workers", 6))
+    bulk_incremental_enabled = bool(data_cfg.get("bulk_incremental_enabled", True))
 
     end_date   = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=history_days)).strftime("%Y%m%d")
@@ -82,7 +83,8 @@ def run(
         stop_event=stop_event,
     )
 
-    if symbols is None:
+    full_universe = symbols is None
+    if full_universe:
         stock_list = fetcher.get_stock_list()
         if stock_list.empty:
             logger.error("获取股票列表失败，中止数据拉取")
@@ -95,13 +97,27 @@ def run(
 
     logger.info("开始拉取 %d 只股票数据（%s ~ %s）...", len(symbols), start_date, end_date)
 
-    fetcher.get_multiple_stocks_history(
-        symbols=symbols,
-        start_date=start_date,
-        end_date=end_date,
-        adjust=adjust,
-        use_cache_only=use_cache_only,
-    )
+    fetch_symbols = symbols
+    if full_universe and bulk_incremental_enabled and not force_refresh and not use_cache_only:
+        fetch_symbols = fetcher.bulk_incremental_update(
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust,
+        )
+
+    if fetch_symbols:
+        if len(fetch_symbols) != len(symbols):
+            logger.info("快速增量后仅需逐票补充 %d/%d 只历史数据", len(fetch_symbols), len(symbols))
+        fetcher.get_multiple_stocks_history(
+            symbols=fetch_symbols,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust,
+            use_cache_only=use_cache_only,
+        )
+    else:
+        logger.info("本地数据库行情完整，跳过逐票抓取")
 
     logger.info("数据拉取完成")
 

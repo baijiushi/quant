@@ -42,6 +42,8 @@ data/candidates/
 data/failures/
 data/ai_scoring/
 data/news_inputs/
+data/knowledge/
+.playwright-cli/
 data/stocklist.csv
 data/oversell.db
 data/oversell.db-*

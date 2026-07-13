@@ -85,10 +85,19 @@ class B1Strategy:
         volume_win = int(cfg.get("volume_ma_window", 20))
         return max(m4 + wma_l * 5, macd_slow + macd_signal, volume_win) + 30
 
-    def prepare_all(self, data: Dict[str, pd.DataFrame], cfg: dict) -> Dict[str, pd.DataFrame]:
+    def prepare_all(
+        self,
+        data: Dict[str, pd.DataFrame],
+        cfg: dict,
+        context: StrategyContext | None = None,
+    ) -> Dict[str, pd.DataFrame]:
         cfg = self._cfg(cfg)
         prepared: Dict[str, pd.DataFrame] = {}
-        for code, df in data.items():
+        total = len(data)
+        logger.info("B1 指标预计算开始：%d 只股票", total)
+        for index, (code, df) in enumerate(data.items(), 1):
+            if context and context.cancel_requested and context.cancel_requested():
+                raise RunCancelledError("任务已被用户终止")
             try:
                 item = compute_kdj(df, int(cfg["kdj_period"]))
                 item = compute_zx_ma(item, int(cfg["zx_m1"]), int(cfg["zx_m2"]), int(cfg["zx_m3"]), int(cfg["zx_m4"]))
@@ -101,6 +110,8 @@ class B1Strategy:
                 prepared[code] = item
             except Exception as exc:
                 logger.debug("B1 prepare failed %s: %s", code, exc)
+            if index % 250 == 0 or index == total:
+                logger.info("B1 指标预计算进度 %d/%d，成功 %d 只", index, total, len(prepared))
         return prepared
 
     def _passes(self, row: pd.Series, cfg: dict) -> bool:
@@ -139,7 +150,12 @@ class B1Strategy:
             return []
 
         warmup = self.warmup_bars(cfg)
-        prepared_data = self.prepare_all(data, cfg)
+        selected_data = (
+            data
+            if context.pool is None
+            else {code: frame for code, frame in data.items() if code in context.pool}
+        )
+        prepared_data = self.prepare_all(selected_data, cfg, context)
         candidates: list[Candidate] = []
         skipped = 0
         processed = 0
@@ -150,8 +166,6 @@ class B1Strategy:
             processed += 1
             if processed % 250 == 0 or processed == len(prepared_data):
                 logger.info("B1选股进度 %d/%d，当前命中 %d 只，跳过 %d 只", processed, len(prepared_data), len(candidates), skipped)
-            if context.pool is not None and code not in context.pool:
-                continue
             if len(df) < warmup or context.pick_date not in df.index:
                 skipped += 1
                 continue

@@ -15,7 +15,13 @@ import pandas as pd
 import tushare as ts
 
 from pipeline.cancellation import RunCancelledError, raise_if_cancelled
-from storage.database import upsert_price_batch, upsert_stocks
+from storage.database import (
+    price_codes,
+    price_data_signature,
+    rescale_qfq_history,
+    upsert_price_batch,
+    upsert_stocks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +93,7 @@ class AStockDataFetcher:
         self._state_lock = Lock()
         self.failed_symbols: dict[str, dict[str, str]] = {}
         self.empty_symbols: set[str] = set()
+        self._db_updates: dict[str, pd.DataFrame] = {}
 
     def _check_cancelled(self) -> None:
         raise_if_cancelled(self.stop_event)
@@ -115,10 +122,10 @@ class AStockDataFetcher:
     @staticmethod
     def _to_ts_code(symbol: str) -> str:
         symbol = str(symbol).zfill(6)
-        if symbol.startswith(("60", "68", "90")):
-            return f"{symbol}.SH"
-        if symbol.startswith(("4", "8")):
+        if symbol.startswith(("4", "8", "92")):
             return f"{symbol}.BJ"
+        if symbol.startswith(("60", "68")):
+            return f"{symbol}.SH"
         return f"{symbol}.SZ"
 
     def _history_file(self, symbol: str, adjust: str = "qfq") -> Path:
@@ -142,6 +149,19 @@ class AStockDataFetcher:
         with self._state_lock:
             self.failed_symbols = {}
             self.empty_symbols = set()
+            self._db_updates = {}
+
+    def _record_db_update(self, symbol: str, frame: pd.DataFrame) -> None:
+        if frame is None or frame.empty:
+            return
+        code = str(symbol).zfill(6)
+        with self._state_lock:
+            existing = self._db_updates.get(code)
+            if existing is None or existing.empty:
+                self._db_updates[code] = frame.copy()
+            else:
+                merged = pd.concat([existing, frame])
+                self._db_updates[code] = merged[~merged.index.duplicated(keep="last")].sort_index()
 
     def _record_failed_symbol(self, symbol: str, stage: str, error_message: str | Exception) -> None:
         code = str(symbol).zfill(6)
@@ -409,6 +429,7 @@ class AStockDataFetcher:
                         head_df = self._fetch_history_from_api(symbol, start_date, head_end, adjust)
                         if not head_df.empty:
                             parts.append(head_df)
+                            self._record_db_update(symbol, head_df)
                     except Exception as exc:
                         if isinstance(exc, RunCancelledError):
                             raise
@@ -423,6 +444,7 @@ class AStockDataFetcher:
                         tail_df = self._fetch_history_from_api(symbol, tail_start, end_date, adjust)
                         if not tail_df.empty:
                             parts.append(tail_df)
+                            self._record_db_update(symbol, tail_df)
                     except Exception as exc:
                         if isinstance(exc, RunCancelledError):
                             raise
@@ -431,7 +453,8 @@ class AStockDataFetcher:
 
                 merged = pd.concat(parts)
                 merged = merged[~merged.index.duplicated(keep="last")].sort_index()
-                self._save_history_cache(symbol, adjust, merged)
+                if len(parts) > 1:
+                    self._save_history_cache(symbol, adjust, merged)
                 self._clear_failed_symbol(symbol)
                 self._clear_empty_symbol(symbol)
                 return merged[(merged.index >= start_dt) & (merged.index <= end_dt)]
@@ -454,6 +477,7 @@ class AStockDataFetcher:
                 return pd.DataFrame()
 
             self._save_history_cache(symbol, adjust, new_df)
+            self._record_db_update(symbol, new_df)
             self._clear_failed_symbol(symbol)
             self._clear_empty_symbol(symbol)
             return new_df
@@ -463,6 +487,124 @@ class AStockDataFetcher:
             self._record_failed_symbol(symbol, "get_stock_history", exc)
             logger.error("获取股票 %s 历史数据失败: %s", symbol, exc)
             return pd.DataFrame()
+
+    def bulk_incremental_update(
+        self,
+        symbols: list[str],
+        start_date: str,
+        end_date: str,
+        adjust: str = "qfq",
+    ) -> list[str]:
+        """Update the whole market by trade date and return codes needing full history.
+
+        TUShare explicitly recommends querying ``daily`` by trade date. Existing
+        qfq history is rebased only when the latest adjustment factor changes.
+        """
+        self._check_cancelled()
+        requested = {str(symbol).zfill(6) for symbol in symbols}
+        existing_codes = price_codes(adjust)
+        missing_codes = sorted(requested - existing_codes)
+        _, latest_date, _ = price_data_signature(adjust)
+        if not latest_date or adjust not in {"qfq", "hfq", "bfq"}:
+            logger.info("SQLite 尚无可用基准行情，回退到单票历史抓取")
+            return sorted(requested)
+
+        cached_latest = pd.Timestamp(latest_date)
+        update_start = max(cached_latest + timedelta(days=1), pd.Timestamp(start_date))
+        update_end = pd.Timestamp(end_date)
+        if update_start > update_end:
+            logger.info("全市场行情已是最新，无需调用日线接口")
+            return missing_codes
+
+        pro = self._ensure_client()
+        calendar = self._call_tushare(
+            pro.trade_cal,
+            exchange="",
+            start_date=update_start.strftime("%Y%m%d"),
+            end_date=update_end.strftime("%Y%m%d"),
+            is_open="1",
+            fields="cal_date,is_open",
+        )
+        if calendar is None or calendar.empty:
+            logger.info("更新区间没有交易日：%s ~ %s", update_start.date(), update_end.date())
+            return missing_codes
+
+        trade_dates = sorted(str(value) for value in calendar["cal_date"].tolist())
+        logger.info("启用 TUShare 全市场快速增量：%d 个交易日，只需按日期批量请求", len(trade_dates))
+
+        previous_factors: dict[str, float] = {}
+        if adjust == "qfq":
+            previous = self._call_tushare(pro.adj_factor, trade_date=cached_latest.strftime("%Y%m%d"))
+            if previous is not None and not previous.empty:
+                previous_factors = dict(zip(previous["ts_code"].str[:6], previous["adj_factor"].astype(float)))
+
+        daily_batches: list[tuple[str, pd.DataFrame, pd.DataFrame | None]] = []
+        latest_factors: dict[str, float] = {}
+        for index, trade_date in enumerate(trade_dates, 1):
+            self._check_cancelled()
+            daily = self._call_tushare(
+                pro.daily,
+                trade_date=trade_date,
+                fields="ts_code,trade_date,open,high,low,close,change,pct_chg,vol,amount",
+            )
+            if daily is None or daily.empty:
+                logger.info("交易日 %s 暂无日线数据，可能尚未收盘入库", trade_date)
+                continue
+            daily = daily[daily["ts_code"].str[:6].isin(requested)].copy()
+            factors: pd.DataFrame | None = None
+            if adjust in {"qfq", "hfq"}:
+                factors = self._call_tushare(pro.adj_factor, trade_date=trade_date)
+                if factors is None or factors.empty:
+                    raise ValueError(f"TUShare 未返回 {trade_date} 复权因子")
+                factors = factors[["ts_code", "adj_factor"]].copy()
+                latest_factors = dict(zip(factors["ts_code"].str[:6], factors["adj_factor"].astype(float)))
+            daily_batches.append((trade_date, daily, factors))
+            logger.info("全市场增量抓取进度 %d/%d：%s，共 %d 条", index, len(trade_dates), trade_date, len(daily))
+
+        if not daily_batches:
+            return missing_codes
+
+        if adjust == "qfq" and previous_factors and latest_factors:
+            ratios = {
+                code: previous_factors[code] / latest_factors[code]
+                for code in existing_codes
+                if code in previous_factors and code in latest_factors and latest_factors[code]
+            }
+            rescale_qfq_history(ratios, cached_latest.strftime("%Y-%m-%d"))
+
+        updates: dict[str, pd.DataFrame] = {}
+        for _, daily, factors in daily_batches:
+            if factors is not None:
+                daily = daily.merge(factors, on="ts_code", how="left")
+            daily["code"] = daily["ts_code"].str[:6]
+            if adjust == "qfq":
+                daily["price_multiplier"] = daily.apply(
+                    lambda row: float(row["adj_factor"]) / latest_factors.get(str(row["code"]), float(row["adj_factor"])),
+                    axis=1,
+                )
+            elif adjust == "hfq":
+                daily["price_multiplier"] = daily["adj_factor"].astype(float)
+            else:
+                daily["price_multiplier"] = 1.0
+            for column in ["open", "high", "low", "close"]:
+                daily[column] = pd.to_numeric(daily[column], errors="coerce") * daily["price_multiplier"]
+            for code, rows in daily.groupby("code"):
+                frame = self._normalize_history_dataframe(rows.rename(columns={"vol": "volume"}))
+                if frame.empty:
+                    continue
+                existing = updates.get(str(code))
+                updates[str(code)] = frame if existing is None else pd.concat([existing, frame]).sort_index()
+
+        logger.info("开始将本轮新增行情同步到 SQLite：%d 只股票", len(updates))
+        upsert_price_batch(updates, adjust)
+        from pipeline.providers import clear_price_cache
+
+        clear_price_cache()
+        logger.info("全市场快速增量完成：新增 %d 个交易日，仍需补历史 %d 只", len(daily_batches), len(missing_codes))
+        if not missing_codes:
+            self._reset_run_state()
+            self._save_failure_reports(len(symbols))
+        return missing_codes
 
     def get_multiple_stocks_history(
         self,
@@ -552,13 +694,16 @@ class AStockDataFetcher:
                 executor.shutdown(wait=True, cancel_futures=True)
 
         self._save_failure_reports(total)
-        # One batch write after all worker threads complete avoids SQLite lock contention.
+        # Write only rows fetched in this run. Cache hits must not rewrite years of history.
         try:
-            upsert_price_batch(stock_data, adjust)
+            with self._state_lock:
+                db_updates = dict(self._db_updates)
+            logger.info("开始同步本轮新增行情到 SQLite：%d 只股票", len(db_updates))
+            upsert_price_batch(db_updates, adjust)
             from pipeline.providers import clear_price_cache
 
             clear_price_cache()
-            logger.info("已同步 %d 只股票的日线数据到 SQLite", len(stock_data))
+            logger.info("已同步 %d 只股票的新增日线到 SQLite", len(db_updates))
         except Exception as exc:  # noqa: BLE001
             # CSV remains the compatibility cache, so a DB failure must not discard fetched data.
             logger.warning("同步日线数据到 SQLite 失败，已保留 CSV 缓存: %s", exc)
