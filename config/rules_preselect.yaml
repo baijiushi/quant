@@ -1,11 +1,11 @@
-active_strategy: volume_new_high
+active_strategy: b1
 global:
   data_dir: data/raw
   stock_list_file: data/stocklist.csv
   output_dir: data/candidates
   adjust: qfq
   top_m: 3000
-  n_turnover_days: 3000
+  n_turnover_days: 43
   markets:
   - star
   - gem
