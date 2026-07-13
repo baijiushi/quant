@@ -67,11 +67,15 @@ python run_all.py --data-mode existing --strategy-id volume_new_high --no-dashbo
 python run_all.py --data-mode incremental --no-dashboard
 ```
 
+增量模式会优先按交易日调用 TUShare 全市场 `daily` 和 `adj_factor` 接口，一般不再循环请求 5,500 只股票。只有数据库中缺少完整历史的新股才会回退到逐票补抓。前复权基准发生变化时，系统会自动重标旧行情。
+
 强制重拉：
 
 ```bash
 python run_all.py --data-mode refresh --no-dashboard
 ```
+
+`refresh` 会逐票重建历史缓存；在每分钟约 200 次的权限下，5,500 只股票理论上需要约 28 分钟。日常运行建议使用 `incremental`，调试策略建议使用 `existing`。
 
 仅使用缓存：
 
@@ -142,6 +146,10 @@ http://127.0.0.1:8000
 
 AI 评分配置位于 `config/ai_scoring.yaml`。评分结果会写入 `data/ai_scoring/`，该目录已加入 `.gitignore`。
 
+默认模型为成本更低的 `deepseek-v4-flash`，开启思考模式和流式输出。网页会实时展示 API 返回的 `reasoning_content`、联网检索进度和最终结构化结果；原始思考可能包含临时判断，最终以 Python 复算后的评分卡为准。
+
+候选股评分默认先使用 DeepSeek 联网检索公开资料，再生成五个维度的逐项简评。每项简评控制在 75–100 个中文字符，并保存实际引用来源；控制台可关闭“联网研究”以缩短耗时和减少费用。检索优先覆盖公告、交易所、政府和其他可靠公开来源，不要求观点必须直接来自指定作者或用户材料。
+
 赛道景气度输入默认读取：
 
 ```text
@@ -168,11 +176,17 @@ scripts\run_ai_scoring.bat --strategy-id volume_new_high
 最终分数 = ((行业景气度 + 业务纯度 + 估值水位 + 龙头 + 辨识度) - 风险扣分 * 0.2) * 流动性系数 / 5
 ```
 
-行业景气度为 0 时，系统要求 AI 给出 `avoid`，即便其他项高分也不作为买入标的。
+AI 只负责维度判断和证据说明，Python 会根据近三年最低价计算估值水位、根据当日全市场成交额计算流动性系数，并按上述公式重算最终分与 `buy/watch/avoid` 研究标签。行业景气度为 0 或存在一票否决风险时，即便其他项高分也固定为 `avoid`。
 
 ### 研究素材与证据链
 
 控制台的“赛道研究素材库”用于保存你已经核对过的视频总结、动态摘录、公告或研报摘要。保存后点击“更新赛道景气度”，这些内容会作为 AI 的显式输入并随评分记录留存。系统不会声称自动读取登录/付费来源，也不会在证据不足时把赛道评为高景气。
+
+项目内 Codex 技能位于 `skills/benben-super-boom/`，AI 评分与技能共用同一份方法论和公开证据。系统每 24 小时检查一次 B 站公开合集目录，目录标题只按弱证据保存；本机授权可见的付费材料应写入已忽略的 `data/knowledge/private_evidence.yaml`，不要提交到公开仓库。手动刷新命令：
+
+```bash
+python -m ai_scoring.run_ai_scoring --skip-sector --skip-candidates --refresh-knowledge
+```
 
 “超景气价值投机”评分依据行业景气度、业务纯度、估值水位、细分龙头、市场辨识度和风险扣分；每个非零维度要求 AI 在结果中列出来源引用。AI 结果只用于研究，不构成投资建议。
 
@@ -215,7 +229,13 @@ scripts\test_browser.bat
 - `GET /api/candidates/latest?strategy_id=b1`：读取指定策略最新结果。
 - `GET /api/ai/sector-scores/latest` / `POST /api/ai/sector-scores/refresh`：读取或更新赛道景气度评分。
 - `GET /api/ai/candidate-scores/latest` / `POST /api/ai/candidate-scores/score`：读取或生成候选股 AI 评分。
+- `GET /api/ai/model`：读取当前 DeepSeek 模型、思考强度和联网检索默认配置。
+- `POST /api/ai/candidate-scores/jobs`：启动可流式跟踪的候选股评分任务。
+- `GET /api/ai/candidate-scores/jobs/current` / `GET /api/ai/candidate-scores/jobs/{job_id}`：恢复或查询评分任务。
+- `GET /api/ai/candidate-scores/jobs/{job_id}/events`：通过 SSE 接收检索进度、思考内容和最终结果。
 - `GET` / `POST` / `DELETE /api/research/documents`：管理 AI 赛道评分使用的研究素材。
+- `GET /api/knowledge/benben/status` / `GET /api/knowledge/benben/documents`：查看方法论知识库状态和证据。
+- `POST /api/knowledge/benben/refresh`：强制刷新公开 B 站合集目录。
 - `POST /api/backtests` / `GET /api/backtests/{id}`：回测接口已预留，当前返回未实现。
 
 ## 风险提示
