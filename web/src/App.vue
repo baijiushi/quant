@@ -89,6 +89,42 @@ interface CandidateAIScore {
   source_refs?: string[] | string;
   risk_deduction?: number;
   liquidity_coefficient?: number;
+  confidence?: number;
+  dimension_reviews?: Record<string, { comment?: string; source_refs?: string[]; length?: number }>;
+  thesis_transmission?: string;
+  invalidation_triggers?: string[] | string;
+  data_needed?: string[] | string;
+  decision_note?: string;
+}
+
+interface AIModelInfo {
+  model: string;
+  thinking_mode: boolean;
+  reasoning_effort: string;
+  web_search_default: boolean;
+  max_search_candidates: number;
+}
+
+interface AIScoreJobStatus {
+  job_id: string;
+  status: "queued" | "running" | "success" | "failed";
+  stage: string;
+  model: string;
+  created_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  reasoning: string;
+  content_preview: string;
+  logs: string[];
+  error?: string | null;
+  result?: Record<string, unknown> | null;
+}
+
+interface CandidateWebResearch {
+  enabled?: boolean;
+  searched_codes?: string[];
+  sources?: Array<{ title: string; url: string }>;
+  error?: string;
 }
 
 interface ResearchDocument {
@@ -125,6 +161,10 @@ const aiSectorScores = ref<Record<string, unknown> | null>(null);
 const aiCandidateScores = ref<Record<string, unknown> | null>(null);
 const aiLoading = ref(false);
 const aiError = ref("");
+const aiModel = ref<AIModelInfo | null>(null);
+const aiScoreJob = ref<AIScoreJobStatus | null>(null);
+const aiWebResearch = ref(true);
+const aiReasoningEl = ref<HTMLPreElement | null>(null);
 const researchDocuments = ref<ResearchDocument[]>([]);
 const researchTitle = ref("");
 const researchContent = ref("");
@@ -132,6 +172,9 @@ const researchUrl = ref("");
 const researchSaving = ref(false);
 let pollTimer: number | null = null;
 let chartResizeObserver: ResizeObserver | null = null;
+let aiEventSource: EventSource | null = null;
+
+const dimensionNames = ["行业景气度", "业务纯度", "估值水位", "细分行业龙头", "市场辨识度"];
 
 const fallbackStrategies: StrategyInfo[] = [
   {
@@ -182,12 +225,25 @@ const activeStrategy = computed(() => config.value?.active_strategy ?? "b1");
 const activeStrategyInfo = computed(() => strategies.value.find((item) => item.id === activeStrategy.value));
 const sectorScoreRows = computed(() => (aiSectorScores.value?.sectors ?? []) as SectorAIScore[]);
 const candidateScoreRows = computed(() => (aiCandidateScores.value?.scores ?? []) as CandidateAIScore[]);
+const aiJobRunning = computed(() => ["queued", "running"].includes(aiScoreJob.value?.status ?? ""));
+const displayedReasoning = computed(() => {
+  const live = aiScoreJob.value?.reasoning;
+  return live || String(aiCandidateScores.value?.reasoning_content ?? "");
+});
+const aiOutputChars = computed(
+  () => aiScoreJob.value?.content_preview?.length || displayedReasoning.value.length || 0
+);
+const candidateWebResearch = computed(
+  () => (aiCandidateScores.value?.web_research ?? {}) as CandidateWebResearch
+);
 const runProgress = computed(() => {
   const stage = runStatus.value?.stage ?? "";
   if (["运行完成", "已终止", "运行失败", "服务重启中断"].includes(stage)) return 100;
   if (stage.includes("保存")) return 92;
   if (stage.includes("策略")) return 75;
+  if (stage.includes("指标")) return 68;
   if (stage.includes("流动性")) return 58;
+  if (stage.includes("数据库")) return 42;
   if (stage.includes("加载")) return 38;
   if (stage.includes("更新") || stage.includes("数据")) return 20;
   return isRunning.value ? 8 : 0;
@@ -277,6 +333,68 @@ async function loadAiScores() {
   }
 }
 
+async function loadAiModel() {
+  try {
+    aiModel.value = await api<AIModelInfo>("/api/ai/model");
+    aiWebResearch.value = aiModel.value.web_search_default;
+  } catch {
+    aiModel.value = {
+      model: "deepseek-v4-flash",
+      thinking_mode: true,
+      reasoning_effort: "high",
+      web_search_default: true,
+      max_search_candidates: 12
+    };
+  }
+}
+
+function closeAiEvents() {
+  aiEventSource?.close();
+  aiEventSource = null;
+}
+
+function applyAiJob(job: AIScoreJobStatus) {
+  aiScoreJob.value = job;
+  aiLoading.value = ["queued", "running"].includes(job.status);
+  if (job.status === "success" && job.result) {
+    aiCandidateScores.value = job.result;
+    message.value = "候选股 AI 评分已完成";
+    closeAiEvents();
+  } else if (job.status === "failed") {
+    aiError.value = job.error || "AI 评分失败";
+    closeAiEvents();
+  }
+}
+
+function connectAiEvents(jobId: string) {
+  closeAiEvents();
+  aiEventSource = new EventSource(`/api/ai/candidate-scores/jobs/${encodeURIComponent(jobId)}/events`);
+  aiEventSource.onmessage = (event) => {
+    applyAiJob(JSON.parse(event.data) as AIScoreJobStatus);
+  };
+  aiEventSource.onerror = async () => {
+    try {
+      const job = await api<AIScoreJobStatus>(`/api/ai/candidate-scores/jobs/${encodeURIComponent(jobId)}`);
+      applyAiJob(job);
+    } catch (error) {
+      aiError.value = error instanceof Error ? error.message : String(error);
+      aiLoading.value = false;
+      closeAiEvents();
+    }
+  };
+}
+
+async function syncCurrentAiJob() {
+  try {
+    const payload = await api<{ job: AIScoreJobStatus | null }>("/api/ai/candidate-scores/jobs/current");
+    if (!payload.job) return;
+    applyAiJob(payload.job);
+    if (["queued", "running"].includes(payload.job.status)) connectAiEvents(payload.job.job_id);
+  } catch {
+    // Older backends do not expose AI jobs; latest persisted scores still load normally.
+  }
+}
+
 async function loadResearchDocuments() {
   try {
     const payload = await api<{ documents: ResearchDocument[] }>("/api/research/documents?limit=20");
@@ -346,18 +464,21 @@ async function refreshSectorScores() {
 async function scoreCandidatesWithAi() {
   aiLoading.value = true;
   aiError.value = "";
+  aiCandidateScores.value = { generated_at: null, scores: [] };
   try {
-    aiCandidateScores.value = await api<Record<string, unknown>>("/api/ai/candidate-scores/score", {
+    const job = await api<AIScoreJobStatus>("/api/ai/candidate-scores/jobs", {
       method: "POST",
       body: JSON.stringify({
         strategy_id: config.value?.active_strategy,
-        max_candidates: 20
+        max_candidates: 20,
+        web_research: aiWebResearch.value
       })
     });
-    message.value = "候选股 AI 评分已完成";
+    aiScoreJob.value = job;
+    message.value = `AI 评分任务 ${job.job_id} 已启动`;
+    connectAiEvents(job.job_id);
   } catch (error) {
     aiError.value = error instanceof Error ? error.message : String(error);
-  } finally {
     aiLoading.value = false;
   }
 }
@@ -656,8 +777,26 @@ function aiListText(value: unknown): string {
   return String(value ?? "-");
 }
 
+function aiRefs(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String).filter(Boolean);
+  return value ? [String(value)] : [];
+}
+
+function dimensionReview(item: CandidateAIScore, name: string) {
+  return item.dimension_reviews?.[name] ?? { comment: "暂无详细评价", source_refs: [], length: 0 };
+}
+
+function isHttpUrl(value: unknown): boolean {
+  return /^https?:\/\//i.test(String(value ?? ""));
+}
+
+function confidenceLabel(value: unknown): string {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? `${Math.round(numeric * 100)}%` : "待核验";
+}
+
 function decisionLabel(value: unknown): string {
-  if (value === "buy") return "可关注买入";
+  if (value === "buy") return "重点研究";
   if (value === "watch") return "观察";
   if (value === "avoid") return "回避";
   return String(value ?? "-");
@@ -685,6 +824,11 @@ watch(klineRows, async () => {
   renderChart();
 });
 
+watch(displayedReasoning, async () => {
+  await nextTick();
+  if (aiReasoningEl.value) aiReasoningEl.value.scrollTop = aiReasoningEl.value.scrollHeight;
+});
+
 onMounted(async () => {
   try {
     bootLoading.value = true;
@@ -699,7 +843,9 @@ onMounted(async () => {
     if (selectedCode.value) {
       await loadKline(selectedCode.value);
     }
+    await loadAiModel();
     await loadAiScores();
+    await syncCurrentAiJob();
     await loadResearchDocuments();
   } catch (error) {
     bootError.value = error instanceof Error ? error.message : String(error);
@@ -716,6 +862,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   clearPollTimer();
+  closeAiEvents();
   chartResizeObserver?.disconnect();
   chartResizeObserver = null;
   window.removeEventListener("resize", resizeChart);
@@ -807,7 +954,7 @@ onUnmounted(() => {
           </label>
           <label class="field">
             <span>成交额窗口（日）</span>
-            <input v-model.number="config.global.n_turnover_days" type="number" min="1" />
+              <input v-model.number="config.global.n_turnover_days" type="number" min="1" max="250" />
             <small class="hint">用于计算滚动成交额，越大越偏长期流动性。示例：20、43、60。</small>
           </label>
         </div>
@@ -1043,17 +1190,49 @@ onUnmounted(() => {
 
         <div class="panel ai-panel">
           <div class="panel-title">
-            <h2>DeepSeek AI 评分</h2>
+            <div>
+              <div class="ai-heading">
+                <h2>DeepSeek AI 评分</h2>
+                <span class="model-badge">{{ aiModel?.model ?? "deepseek-v4-flash" }}</span>
+              </div>
+              <p class="hint">Flash 思考模式 · Python 复算总分 · 联网资料附来源</p>
+            </div>
             <div class="ai-actions">
+              <label class="ai-search-toggle">
+                <input v-model="aiWebResearch" type="checkbox" :disabled="aiLoading" />
+                联网检索个股
+              </label>
               <button :disabled="aiLoading" @click="refreshSectorScores">
                 更新赛道景气度
               </button>
               <button :disabled="aiLoading || !candidates.length" @click="scoreCandidatesWithAi">
-                评分当前候选
+                {{ aiJobRunning ? "评分进行中" : "评分当前候选" }}
               </button>
             </div>
           </div>
           <p v-if="aiError" class="error">{{ aiError }}</p>
+
+          <section v-if="aiScoreJob || displayedReasoning" class="ai-stream-panel">
+            <div class="ai-stream-head">
+              <div>
+                <strong>{{ aiScoreJob?.stage ?? "上次评分思考记录" }}</strong>
+                <span v-if="aiScoreJob">任务 {{ aiScoreJob.job_id }}</span>
+              </div>
+              <div class="stream-stats">
+                <span>{{ aiScoreJob?.model ?? aiCandidateScores?.model ?? aiModel?.model }}</span>
+                <span>已生成 {{ aiOutputChars }} 字符</span>
+              </div>
+            </div>
+            <div v-if="aiJobRunning" class="thinking-line"><i></i></div>
+            <p class="stream-note">
+              以下内容来自 DeepSeek API 的 <code>reasoning_content</code>，会随模型输出实时更新。原始思考可能包含临时判断，
+              估值水位、流动性系数和最终分以 Python 复算后的评分卡为准。
+            </p>
+            <pre ref="aiReasoningEl" class="ai-reasoning">{{ displayedReasoning || "正在准备资料，思考内容即将开始输出..." }}</pre>
+            <div v-if="aiScoreJob?.logs?.length" class="ai-job-logs">
+              <span v-for="line in aiScoreJob.logs.slice(-5)" :key="line">{{ line }}</span>
+            </div>
+          </section>
 
           <div class="ai-grid">
             <section>
@@ -1096,6 +1275,7 @@ onUnmounted(() => {
                       <th>行业</th>
                       <th>分数</th>
                       <th>结论</th>
+                      <th>置信度</th>
                       <th>证据</th>
                       <th>理由</th>
                     </tr>
@@ -1107,24 +1287,69 @@ onUnmounted(() => {
                       <td>{{ item.industry ?? "-" }}</td>
                       <td>{{ Number(item.final_score ?? 0).toFixed(1) }}</td>
                       <td>{{ decisionLabel(item.decision) }}</td>
+                      <td>{{ confidenceLabel(item.confidence) }}</td>
                       <td>{{ sourceCountLabel(item) }}</td>
-                      <td>{{ item.rationale ?? aiListText(item.evidence_gaps) }}</td>
+                      <td class="rationale-cell">{{ item.rationale ?? aiListText(item.evidence_gaps) }}</td>
                     </tr>
                     <tr v-if="!candidateScoreRows.length">
-                      <td colspan="7" class="empty-cell">暂无个股 AI 评分</td>
+                      <td colspan="8" class="empty-cell">{{ aiJobRunning ? "正在生成详细评分..." : "暂无个股 AI 评分" }}</td>
                     </tr>
                   </tbody>
                 </table>
               </div>
             </section>
           </div>
+          <div v-if="candidateWebResearch.enabled" class="web-evidence-summary">
+            <strong>联网资料</strong>
+            <span>已检索 {{ candidateWebResearch.searched_codes?.length ?? 0 }} 只股票，获得 {{ candidateWebResearch.sources?.length ?? 0 }} 个来源</span>
+            <span v-if="candidateWebResearch.error" class="error-inline">{{ candidateWebResearch.error }}</span>
+            <div class="source-links">
+              <a
+                v-for="source in candidateWebResearch.sources?.slice(0, 20) ?? []"
+                :key="source.url"
+                :href="source.url"
+                target="_blank"
+                rel="noreferrer"
+              >{{ source.title }}</a>
+            </div>
+          </div>
           <div v-if="candidateScoreRows.length" class="ai-detail-list">
             <details v-for="item in candidateScoreRows" :key="`${item.code}-detail`">
-              <summary>{{ item.code }} {{ item.name }} 的评分明细</summary>
-              <p><strong>五维评分：</strong>{{ JSON.stringify(item.dimension_scores ?? {}) }}</p>
-              <p><strong>风险扣分：</strong>{{ item.risk_deduction ?? "-" }}，<strong>流动性系数：</strong>{{ item.liquidity_coefficient ?? "-" }}</p>
-              <p><strong>来源：</strong>{{ aiListText(item.source_refs) }}</p>
-              <p><strong>待补充：</strong>{{ aiListText(item.evidence_gaps) }}</p>
+              <summary>
+                <span>{{ item.code }} {{ item.name }} 的评分明细</span>
+                <b>{{ Number(item.final_score ?? 0).toFixed(1) }} 分 · {{ confidenceLabel(item.confidence) }}</b>
+              </summary>
+              <p class="candidate-rationale">{{ item.rationale ?? "暂无综合评价" }}</p>
+              <div class="dimension-review-grid">
+                <article v-for="name in dimensionNames" :key="`${item.code}-${name}`">
+                  <div>
+                    <strong>{{ name }}</strong>
+                    <span>{{ Number(item.dimension_scores?.[name] ?? 0).toFixed(0) }} 分</span>
+                  </div>
+                  <p>{{ dimensionReview(item, name).comment }}</p>
+                  <div v-if="dimensionReview(item, name).source_refs?.length" class="dimension-sources">
+                    <template v-for="source in aiRefs(dimensionReview(item, name).source_refs)" :key="source">
+                      <a v-if="isHttpUrl(source)" :href="source" target="_blank" rel="noreferrer">查看来源</a>
+                      <span v-else>{{ source }}</span>
+                    </template>
+                  </div>
+                </article>
+              </div>
+              <div class="score-meta">
+                <span><strong>风险扣分</strong>{{ item.risk_deduction ?? "-" }}</span>
+                <span><strong>流动性系数</strong>{{ item.liquidity_coefficient ?? "-" }}</span>
+                <span><strong>结论</strong>{{ decisionLabel(item.decision) }}</span>
+              </div>
+              <p><strong>逻辑传导：</strong>{{ item.thesis_transmission ?? "待补充" }}</p>
+              <p><strong>失效条件：</strong>{{ aiListText(item.invalidation_triggers) }}</p>
+              <p><strong>风险事件：</strong>{{ aiListText(item.risk_events) }}</p>
+              <p><strong>待补充：</strong>{{ aiListText(item.evidence_gaps ?? item.data_needed) }}</p>
+              <div class="source-links detail-sources">
+                <template v-for="source in aiRefs(item.source_refs)" :key="source">
+                  <a v-if="isHttpUrl(source)" :href="source" target="_blank" rel="noreferrer">{{ source }}</a>
+                  <span v-else>{{ source }}</span>
+                </template>
+              </div>
             </details>
           </div>
         </div>
