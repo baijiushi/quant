@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +13,7 @@ import pandas as pd
 import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -21,6 +22,12 @@ from ai_scoring.service import (
     latest_sector_scores,
     refresh_sector_scores,
     score_latest_candidates,
+)
+from ai_scoring.knowledge import (
+    ensure_knowledge_fresh,
+    knowledge_documents,
+    knowledge_status,
+    refresh_public_knowledge,
 )
 from pipeline.cancellation import RunCancelledError
 from pipeline.runtime import DATA_MODES, run_pipeline
@@ -42,6 +49,7 @@ from storage.database import (
 ROOT = Path(__file__).resolve().parent.parent
 FETCH_CONFIG = ROOT / "config" / "fetch_data.yaml"
 RULES_CONFIG = ROOT / "config" / "rules_preselect.yaml"
+AI_CONFIG = ROOT / "config" / "ai_scoring.yaml"
 LATEST_CANDIDATES = ROOT / "data" / "candidates" / "candidates_latest.json"
 LATEST_FAILURES = ROOT / "data" / "failures" / "failed_symbols_latest.json"
 WEB_DIST = ROOT / "web" / "dist"
@@ -98,6 +106,22 @@ class SectorScoreRequest(BaseModel):
 class CandidateAIScoreRequest(BaseModel):
     strategy_id: str | None = None
     max_candidates: int | None = None
+    web_research: bool = True
+
+
+class AIScoreJobStatus(BaseModel):
+    job_id: str
+    status: Literal["queued", "running", "success", "failed"]
+    stage: str = "等待开始"
+    model: str = "deepseek-v4-flash"
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    reasoning: str = ""
+    content_preview: str = ""
+    logs: list[str] = Field(default_factory=list)
+    error: str | None = None
+    result: dict[str, Any] | None = None
 
 
 class ResearchDocumentRequest(BaseModel):
@@ -111,12 +135,24 @@ class ResearchDocumentRequest(BaseModel):
 _runs: dict[str, RunStatus] = {}
 _run_cancel_events: dict[str, threading.Event] = {}
 _runs_lock = threading.Lock()
+_ai_score_jobs: dict[str, AIScoreJobStatus] = {}
+_ai_jobs_lock = threading.Lock()
 
 
 @app.on_event("startup")
 def initialize_local_store() -> None:
     init_db()
     mark_interrupted_runs()
+    threading.Thread(target=_knowledge_refresh_loop, daemon=True, name="knowledge-refresh").start()
+
+
+def _knowledge_refresh_loop() -> None:
+    while True:
+        try:
+            ensure_knowledge_fresh()
+        except Exception:  # noqa: BLE001
+            logger.exception("后台知识库更新失败，继续使用本地资料")
+        time.sleep(3600)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
@@ -130,6 +166,18 @@ def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
+
+
+def _ai_model_config() -> dict[str, Any]:
+    deepseek = _read_yaml(AI_CONFIG).get("deepseek", {})
+    scoring = _read_yaml(AI_CONFIG).get("scoring", {})
+    return {
+        "model": str(deepseek.get("model", "deepseek-v4-flash")),
+        "thinking_mode": True,
+        "reasoning_effort": str(deepseek.get("reasoning_effort", "high")),
+        "web_search_default": bool(scoring.get("candidate_web_search_enabled", True)),
+        "max_search_candidates": int(scoring.get("max_search_candidates", 12)),
+    }
 
 
 def _load_config() -> ConfigPayload:
@@ -205,12 +253,16 @@ class _RunLogHandler(logging.Handler):
 
 
 def _stage_from_log(message: str) -> str | None:
+    if "SQLite" in message and ("同步" in message or "读取" in message or "整理" in message):
+        return "同步/加载数据库"
     if "拉取" in message or "TUShare" in message or "缓存" in message and "加载" not in message:
         return "数据更新"
     if "加载本地日线数据" in message or "加载缓存数据" in message:
         return "加载本地数据"
     if "流动性过滤" in message:
         return "流动性过滤"
+    if "指标预计算" in message:
+        return "指标计算"
     if "B1选股进度" in message or "缩量新高进度" in message or "运行策略" in message:
         return "策略筛选"
     if "候选结果已保存" in message or "选股完成" in message:
@@ -507,15 +559,172 @@ def get_latest_candidate_scores(strategy_id: str | None = None) -> dict[str, Any
     return payload
 
 
+def _ai_job_dump(job: AIScoreJobStatus) -> dict[str, Any]:
+    return job.model_dump() if hasattr(job, "model_dump") else job.dict()
+
+
+def _get_ai_job(job_id: str) -> AIScoreJobStatus | None:
+    with _ai_jobs_lock:
+        job = _ai_score_jobs.get(job_id)
+        return AIScoreJobStatus(**_ai_job_dump(job)) if job else None
+
+
+def _append_ai_job_progress(job_id: str, message: str) -> None:
+    with _ai_jobs_lock:
+        job = _ai_score_jobs.get(job_id)
+        if not job:
+            return
+        job.stage = message
+        job.logs.append(f"{datetime.now().strftime('%H:%M:%S')} {message}")
+        job.logs = job.logs[-200:]
+
+
+def _append_ai_stream(job_id: str, kind: str, text: str) -> None:
+    with _ai_jobs_lock:
+        job = _ai_score_jobs.get(job_id)
+        if not job:
+            return
+        if kind == "reasoning":
+            job.stage = "DeepSeek 正在思考"
+            job.reasoning = (job.reasoning + text)[-160_000:]
+        else:
+            job.stage = "正在生成结构化评分"
+            job.content_preview = (job.content_preview + text)[-160_000:]
+
+
+def _run_ai_score_job(job_id: str, score_request: CandidateAIScoreRequest) -> None:
+    with _ai_jobs_lock:
+        job = _ai_score_jobs[job_id]
+        job.status = "running"
+        job.stage = "准备候选资料"
+        job.started_at = datetime.now().isoformat(timespec="seconds")
+        job.logs.append(f"{datetime.now().strftime('%H:%M:%S')} 开始候选股 AI 评分")
+    try:
+        result = score_latest_candidates(
+            strategy_id=score_request.strategy_id,
+            max_candidates=score_request.max_candidates,
+            web_research=score_request.web_research,
+            stream_callback=lambda kind, text: _append_ai_stream(job_id, kind, text),
+            progress_callback=lambda message: _append_ai_job_progress(job_id, message),
+        )
+        with _ai_jobs_lock:
+            job = _ai_score_jobs[job_id]
+            job.status = "success"
+            job.stage = "评分完成"
+            job.finished_at = datetime.now().isoformat(timespec="seconds")
+            job.result = result
+            job.logs.append(f"{datetime.now().strftime('%H:%M:%S')} 评分完成")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("AI score job %s failed", job_id)
+        with _ai_jobs_lock:
+            job = _ai_score_jobs[job_id]
+            job.status = "failed"
+            job.stage = "评分失败"
+            job.finished_at = datetime.now().isoformat(timespec="seconds")
+            job.error = str(exc)
+            job.logs.append(f"{datetime.now().strftime('%H:%M:%S')} 评分失败：{exc}")
+
+
+@app.get("/api/ai/model")
+def get_ai_model() -> dict[str, Any]:
+    return _ai_model_config()
+
+
+@app.post("/api/ai/candidate-scores/jobs", response_model=AIScoreJobStatus)
+def create_candidate_score_job(request: CandidateAIScoreRequest) -> AIScoreJobStatus:
+    with _ai_jobs_lock:
+        active = next((item for item in _ai_score_jobs.values() if item.status in {"queued", "running"}), None)
+        if active:
+            raise HTTPException(status_code=409, detail=f"已有 AI 评分任务正在运行: {active.job_id}")
+        job_id = uuid.uuid4().hex[:12]
+        job = AIScoreJobStatus(
+            job_id=job_id,
+            status="queued",
+            model=_ai_model_config()["model"],
+            created_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        _ai_score_jobs[job_id] = job
+    threading.Thread(target=_run_ai_score_job, args=(job_id, request), daemon=True, name=f"ai-score-{job_id}").start()
+    return job
+
+
+@app.get("/api/ai/candidate-scores/jobs/current")
+def get_current_candidate_score_job() -> dict[str, Any]:
+    with _ai_jobs_lock:
+        active = next(
+            (item for item in reversed(_ai_score_jobs.values()) if item.status in {"queued", "running"}),
+            None,
+        )
+        current = active or (next(reversed(_ai_score_jobs.values()), None) if _ai_score_jobs else None)
+        return {"job": _ai_job_dump(current) if current else None}
+
+
+@app.get("/api/ai/candidate-scores/jobs/{job_id}", response_model=AIScoreJobStatus)
+def get_candidate_score_job(job_id: str) -> AIScoreJobStatus:
+    job = _get_ai_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="AI score job not found")
+    return job
+
+
+@app.get("/api/ai/candidate-scores/jobs/{job_id}/events")
+def stream_candidate_score_job(job_id: str) -> StreamingResponse:
+    if not _get_ai_job(job_id):
+        raise HTTPException(status_code=404, detail="AI score job not found")
+
+    def events():
+        last_payload = ""
+        while True:
+            job = _get_ai_job(job_id)
+            if not job:
+                break
+            payload = json.dumps(_ai_job_dump(job), ensure_ascii=False, default=str)
+            if payload != last_payload:
+                yield f"data: {payload}\n\n"
+                last_payload = payload
+            if job.status in {"success", "failed"}:
+                break
+            time.sleep(0.25)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/api/ai/candidate-scores/score")
 def post_score_candidates(request: CandidateAIScoreRequest) -> dict[str, Any]:
     try:
-        return score_latest_candidates(strategy_id=request.strategy_id, max_candidates=request.max_candidates)
+        return score_latest_candidates(
+            strategy_id=request.strategy_id,
+            max_candidates=request.max_candidates,
+            web_research=request.web_research,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         logger.exception("AI candidate scoring failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/knowledge/benben/status")
+def get_benben_knowledge_status() -> dict[str, Any]:
+    return knowledge_status()
+
+
+@app.get("/api/knowledge/benben/documents")
+def get_benben_knowledge_documents(limit: int = 100) -> dict[str, Any]:
+    return {"documents": knowledge_documents(limit=max(1, min(limit, 300)))}
+
+
+@app.post("/api/knowledge/benben/refresh")
+def post_refresh_benben_knowledge() -> dict[str, Any]:
+    try:
+        return refresh_public_knowledge(force=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("知识库更新失败")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/research/documents")

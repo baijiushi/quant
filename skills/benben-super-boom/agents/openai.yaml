@@ -1,0 +1,7 @@
+interface:
+  display_name: "超景气证据评分"
+  short_description: "按公开超景气方法论进行可追溯的赛道与个股研究"
+  brand_color: "#0B6B57"
+  default_prompt: "Use $benben-super-boom to evaluate this A-share sector and candidate with traceable evidence."
+policy:
+  allow_implicit_invocation: true

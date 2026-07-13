@@ -1,0 +1,50 @@
+knowledge_id: benben-super-boom
+version: 1.0.0
+documents:
+  - source_key: creator-profile
+    title: 笨笨的韭菜公开简介
+    source_url: https://space.bilibili.com/11473291
+    source_type: creator_profile
+    evidence_level: direct
+    content: >-
+      创作者公开简介强调“景气投资”、实盘记录与选股逻辑分享，并持续更新超景气投资方向观点；同时声明不推荐买卖、没有粉丝群。
+  - source_key: foundational-video-description
+    title: 超景气价值投机-基础框架（一）公开视频简介
+    source_url: https://www.bilibili.com/video/BV1qoUkYyEEd/
+    source_type: creator_video_description
+    evidence_level: direct
+    content: >-
+      公开视频简介给出的基础路径是：识别现象级事件（包含寻找高景气赛道），识别细分板块机会，最后寻找有价值的个股机会。
+  - source_key: phenomenon-video-description
+    title: 识别现象级事件（三）公开视频简介
+    source_url: https://www.bilibili.com/video/BV12SzpYjExt/
+    source_type: creator_video_description
+    evidence_level: direct
+    content: >-
+      公开视频简介指出，投资者每天面对海量新闻、突发事件与政策规划，需要识别能够对板块产生长远真实利好的现象级事件，这是该模式的第一步。
+  - source_key: scoring-video-description
+    title: 个股评分（二）公开视频简介
+    source_url: https://www.bilibili.com/video/BV1BJBxYzEao/
+    source_type: creator_video_description
+    evidence_level: direct
+    content: >-
+      公开视频简介将个股评分称为超景气价值投机模式的最终选股模型，目标是避免踩坑并寻找符合市场偏好的潜在机会；简介本身没有公开具体算式。
+  - source_key: user-scoring-rubric
+    title: 用户提供的超景气价值投机评分表
+    source_type: user_provided
+    evidence_level: user_primary
+    content: >-
+      五个正向维度为行业景气度、业务纯度、估值水位、细分行业龙头、市场辨识度，各0-100；风险为扣分项。项目采用公式：((五项之和)-风险扣分*0.2)*流动性系数/5。全市场成交额低于0.8万亿元取0.8，高于1.5万亿元取1.2，其余取1.0；行业景气度为0时不得操作。原材料中的个别算例与文字规则算术不一致，因此由程序按公式统一复算。
+  - source_key: secondary-foundation-note
+    title: 基础框架公开视频的公开课代表笔记
+    source_url: https://www.bilibili.com/video/BV1qoUkYyEEd/
+    source_type: secondary_note
+    evidence_level: secondary
+    content: >-
+      二手笔记归纳了事件到行业、细分链条再到个股的路径；现象级事件需考察重大性、覆盖面、供需占比和时效；新产业检查政策资本、市场空间、商业化与盈利，传统反转检查深跌、产能出清、需求和经济性。该笔记不是创作者亲笔，使用时必须与直接材料区分。
+  - source_key: user-june-holdings
+    title: 用户提供的六月持仓截图观察
+    source_type: user_screenshot
+    evidence_level: user_primary
+    content: >-
+      用户说明该截图为六月持仓。可见标的集中在半导体设计、晶圆制造、材料、设备与封测，同时包含新能源与资源品。由此推断组合偏向自主可控产业链并跨环节配置；这只是组合行为推断，不能作为创作者明确规则。截图本身未显示可核验日期。

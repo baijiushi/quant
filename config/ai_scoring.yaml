@@ -2,7 +2,8 @@ deepseek:
   base_url: https://api.deepseek.com
   model: deepseek-v4-flash
   temperature: 0.2
-  max_tokens: 4096
+  max_tokens: 24000
+  reasoning_effort: high
 
 scoring:
   max_source_chars: 24000
@@ -11,3 +12,18 @@ scoring:
   candidate_output_dir: data/ai_scoring
   news_input_dir: data/news_inputs
   source_urls: []
+  candidate_web_search_enabled: true
+  max_search_candidates: 8
+  web_search_max_uses: 8
+
+knowledge:
+  enabled: true
+  auto_update: true
+  update_interval_hours: 24
+  collections:
+    - season_id: 4139613
+      mid: 11473291
+      name: 选股逻辑-教学视频
+    - season_id: 4139609
+      mid: 11473291
+      name: 高景气机会-事件分析
