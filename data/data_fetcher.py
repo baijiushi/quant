@@ -572,28 +572,61 @@ class AStockDataFetcher:
             }
             rescale_qfq_history(ratios, cached_latest.strftime("%Y-%m-%d"))
 
-        updates: dict[str, pd.DataFrame] = {}
-        for _, daily, factors in daily_batches:
+        total_rows = sum(len(daily) for _, daily, _ in daily_batches)
+        logger.info(
+            "开始整理全市场增量行情：%d 个交易日，共 %d 条记录",
+            len(daily_batches),
+            total_rows,
+        )
+        prepared_batches: list[pd.DataFrame] = []
+        prepare_started = time.monotonic()
+        for batch_index, (trade_date, daily, factors) in enumerate(daily_batches, 1):
+            self._check_cancelled()
             if factors is not None:
                 daily = daily.merge(factors, on="ts_code", how="left")
             daily["code"] = daily["ts_code"].str[:6]
             if adjust == "qfq":
-                daily["price_multiplier"] = daily.apply(
-                    lambda row: float(row["adj_factor"]) / latest_factors.get(str(row["code"]), float(row["adj_factor"])),
-                    axis=1,
-                )
+                baseline_factors = daily["code"].map(latest_factors)
+                baseline_factors = baseline_factors.fillna(daily["adj_factor"]).astype(float)
+                daily["price_multiplier"] = daily["adj_factor"].astype(float) / baseline_factors
             elif adjust == "hfq":
                 daily["price_multiplier"] = daily["adj_factor"].astype(float)
             else:
                 daily["price_multiplier"] = 1.0
             for column in ["open", "high", "low", "close"]:
                 daily[column] = pd.to_numeric(daily[column], errors="coerce") * daily["price_multiplier"]
-            for code, rows in daily.groupby("code"):
-                frame = self._normalize_history_dataframe(rows.rename(columns={"vol": "volume"}))
-                if frame.empty:
-                    continue
-                existing = updates.get(str(code))
-                updates[str(code)] = frame if existing is None else pd.concat([existing, frame]).sort_index()
+
+            prepared_batches.append(daily.rename(columns={"vol": "volume"}))
+            logger.info(
+                "增量行情预处理进度 %d/%d（%.0f%%）：%s，共 %d 条，耗时 %.1f 秒",
+                batch_index,
+                len(daily_batches),
+                batch_index / len(daily_batches) * 100,
+                trade_date,
+                len(daily),
+                time.monotonic() - prepare_started,
+            )
+
+        self._check_cancelled()
+        combined = pd.concat(prepared_batches, ignore_index=True)
+        grouped = combined.groupby("code", sort=False)
+        stock_total = int(combined["code"].nunique())
+        updates: dict[str, pd.DataFrame] = {}
+        normalize_started = time.monotonic()
+        logger.info("开始按股票整理增量行情：共 %d 只股票", stock_total)
+        for stock_index, (code, rows) in enumerate(grouped, 1):
+            self._check_cancelled()
+            frame = self._normalize_history_dataframe(rows)
+            if not frame.empty:
+                updates[str(code)] = frame
+            if stock_index % 250 == 0 or stock_index == stock_total:
+                logger.info(
+                    "增量行情按股票整理进度 %d/%d（%.1f%%），耗时 %.1f 秒",
+                    stock_index,
+                    stock_total,
+                    stock_index / stock_total * 100,
+                    time.monotonic() - normalize_started,
+                )
 
         logger.info("开始将本轮新增行情同步到 SQLite：%d 只股票", len(updates))
         upsert_price_batch(updates, adjust)
