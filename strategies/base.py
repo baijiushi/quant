@@ -24,6 +24,8 @@ class StrategyContext:
     pool: Optional[Set[str]] = None
     markets: list[str] = field(default_factory=list)
     cancel_requested: Optional[Callable[[], bool]] = None
+    progress_enabled: bool = True
+    progress_callback: Optional[Callable[[str, int, int], None]] = None
 
 
 class BaseStrategy(Protocol):
@@ -32,7 +34,20 @@ class BaseStrategy(Protocol):
     def warmup_bars(self, cfg: dict) -> int:
         ...
 
-    def prepare_all(self, data: Dict[str, pd.DataFrame], cfg: dict) -> Dict[str, pd.DataFrame]:
+    def prepare_all(
+        self,
+        data: Dict[str, pd.DataFrame],
+        cfg: dict,
+        context: StrategyContext | None = None,
+    ) -> Dict[str, pd.DataFrame]:
+        ...
+
+    def select_prepared(
+        self,
+        data: Dict[str, pd.DataFrame],
+        cfg: dict,
+        context: StrategyContext,
+    ) -> list[Candidate]:
         ...
 
     def select(

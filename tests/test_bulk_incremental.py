@@ -117,14 +117,20 @@ class BulkIncrementalTests(unittest.TestCase):
                 )
                 database.upsert_daily_prices("000001", "qfq", old)
 
-                missing = _TestFetcher().bulk_incremental_update(
-                    ["000001"], start_date="20260701", end_date="20260710", adjust="qfq"
-                )
+                with self.assertLogs(level=logging.INFO) as captured:
+                    missing = _TestFetcher().bulk_incremental_update(
+                        ["000001"], start_date="20260701", end_date="20260710", adjust="qfq"
+                    )
                 loaded = database.load_daily_prices("qfq", 1, ["000001"])["000001"]
 
                 self.assertEqual(missing, [])
                 self.assertAlmostEqual(float(loaded.loc[pd.Timestamp("2026-07-09"), "close"]), 5.0)
                 self.assertAlmostEqual(float(loaded.loc[pd.Timestamp("2026-07-10"), "close"]), 6.0)
+                messages = "\n".join(captured.output)
+                self.assertIn("前复权基准更新进度 1/1", messages)
+                self.assertIn("增量行情预处理进度 1/1", messages)
+                self.assertIn("增量行情按股票整理进度 1/1", messages)
+                self.assertIn("SQLite 行情同步进度 1/1", messages)
             finally:
                 database.DB_PATH = original_path
 

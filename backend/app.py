@@ -29,21 +29,29 @@ from ai_scoring.knowledge import (
     knowledge_status,
     refresh_public_knowledge,
 )
+from backtest.schemas import BacktestRequest as BacktestServiceRequest
+from backtest.service import run_backtest
 from pipeline.cancellation import RunCancelledError
 from pipeline.runtime import DATA_MODES, run_pipeline
 from pipeline.select_stock import normalize_strategy_config
 from strategies.registry import list_strategies
 from storage.database import (
+    get_backtest_run as db_get_backtest,
+    get_current_backtest_run as db_current_backtest,
     get_current_pipeline_run as db_current_run,
     get_pipeline_run as db_get_run,
     init_db,
     latest_candidate_run as db_latest_candidates,
+    list_trade_dates,
+    load_backtest_result,
     load_daily_prices,
     load_stocks,
     mark_interrupted_runs,
+    save_backtest_result,
     save_research_document,
     delete_research_document,
     upsert_pipeline_run,
+    upsert_backtest_run,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -99,6 +107,36 @@ class CurrentRunResponse(BaseModel):
     run: RunStatus | None = None
 
 
+class BacktestRunRequest(BaseModel):
+    strategy_id: str
+    start_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    holding_days: int = Field(default=5, ge=1, le=60)
+    config: ConfigPayload | None = None
+
+
+class BacktestStatus(BaseModel):
+    backtest_id: str
+    strategy_id: str
+    start_date: str
+    end_date: str
+    holding_days: int
+    status: Literal["queued", "running", "cancelling", "success", "failed", "cancelled"]
+    stage: str = "等待开始"
+    progress: float = 0
+    processed_days: int = 0
+    total_days: int = 0
+    started_at: str | None = None
+    finished_at: str | None = None
+    error: str | None = None
+    logs: list[str] = Field(default_factory=list)
+    result: dict[str, Any] | None = None
+
+
+class CurrentBacktestResponse(BaseModel):
+    backtest: BacktestStatus | None = None
+
+
 class SectorScoreRequest(BaseModel):
     extra_context: str | None = None
 
@@ -137,6 +175,9 @@ _run_cancel_events: dict[str, threading.Event] = {}
 _runs_lock = threading.Lock()
 _ai_score_jobs: dict[str, AIScoreJobStatus] = {}
 _ai_jobs_lock = threading.Lock()
+_backtest_runs: dict[str, BacktestStatus] = {}
+_backtest_cancel_events: dict[str, threading.Event] = {}
+_backtests_lock = threading.Lock()
 
 
 @app.on_event("startup")
@@ -239,6 +280,139 @@ def _get_current_run_locked() -> RunStatus | None:
     return next(reversed(_runs.values()), None) if _runs else None
 
 
+def _persist_backtest(status: BacktestStatus, request_payload: dict[str, Any] | None = None) -> None:
+    payload = status.model_dump() if hasattr(status, "model_dump") else status.dict()
+    upsert_backtest_run(payload, request_payload)
+
+
+def _set_backtest_status(backtest_id: str, **updates: Any) -> BacktestStatus:
+    with _backtests_lock:
+        old = _backtest_runs[backtest_id]
+        current = old.model_copy(update=updates) if hasattr(old, "model_copy") else old.copy(update=updates)
+        _backtest_runs[backtest_id] = current
+        _persist_backtest(current)
+        return current
+
+
+def _append_backtest_log(backtest_id: str, message: str) -> None:
+    with _backtests_lock:
+        status = _backtest_runs.get(backtest_id)
+        if status is None:
+            return
+        status.logs.append(f"{datetime.now().strftime('%H:%M:%S')} {message}")
+        if len(status.logs) > 500:
+            status.logs = status.logs[-500:]
+        _persist_backtest(status)
+
+
+def _update_backtest_progress(
+    backtest_id: str,
+    stage: str,
+    message: str,
+    current: int,
+    total: int,
+) -> None:
+    ratio = current / total if total else 0.0
+    if stage == "加载行情":
+        overall = 3.0 if current == 0 else 8.0
+    elif stage == "指标预计算":
+        overall = 8.0 + ratio * 22.0
+    elif stage == "逐日选股":
+        overall = 30.0 + ratio * 68.0
+    else:
+        overall = min(99.0, ratio * 100.0)
+    with _backtests_lock:
+        status = _backtest_runs.get(backtest_id)
+        if status is None:
+            return
+        status.logs.append(f"{datetime.now().strftime('%H:%M:%S')} {message}")
+        if len(status.logs) > 500:
+            status.logs = status.logs[-500:]
+        updates: dict[str, Any] = {"stage": stage, "progress": round(overall, 1)}
+        if stage == "逐日选股":
+            updates.update({"processed_days": current, "total_days": total})
+        current_status = status.model_copy(update=updates) if hasattr(status, "model_copy") else status.copy(update=updates)
+        _backtest_runs[backtest_id] = current_status
+        _persist_backtest(current_status)
+
+
+def _get_current_backtest_locked() -> BacktestStatus | None:
+    active = next(
+        (item for item in reversed(_backtest_runs.values()) if item.status in {"queued", "running", "cancelling"}),
+        None,
+    )
+    if active is not None:
+        return active
+    return next(reversed(_backtest_runs.values()), None) if _backtest_runs else None
+
+
+def _run_backtest_background(backtest_id: str, request: BacktestRunRequest) -> None:
+    stop_event = _backtest_cancel_events.get(backtest_id)
+    _set_backtest_status(
+        backtest_id,
+        status="running",
+        stage="准备回测",
+        progress=1.0,
+        started_at=datetime.now().isoformat(timespec="seconds"),
+    )
+    try:
+        config_model = request.config or _load_config()
+        config_payload = (
+            config_model.model_dump(by_alias=True)
+            if hasattr(config_model, "model_dump")
+            else config_model.dict(by_alias=True)
+        )
+        service_request = BacktestServiceRequest(
+            strategy_id=request.strategy_id,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            holding_days=request.holding_days,
+            config=config_payload,
+        )
+        result = run_backtest(
+            backtest_id,
+            service_request,
+            stop_event=stop_event,
+            progress=lambda stage, message, current, total: _update_backtest_progress(
+                backtest_id, stage, message, current, total
+            ),
+        )
+        result_payload = result.to_dict()
+        _update_backtest_progress(backtest_id, "保存结果", "正在保存回测统计和逐笔交易", 99, 100)
+        save_backtest_result(backtest_id, result_payload)
+        summary = dict(result_payload)
+        summary.pop("trades", None)
+        _set_backtest_status(
+            backtest_id,
+            status="success",
+            stage="回测完成",
+            progress=100.0,
+            finished_at=datetime.now().isoformat(timespec="seconds"),
+            result=summary,
+        )
+        _append_backtest_log(backtest_id, f"回测完成，共 {result.metrics.get('signal_count', 0)} 条信号")
+    except RunCancelledError:
+        _append_backtest_log(backtest_id, "回测已由用户终止")
+        _set_backtest_status(
+            backtest_id,
+            status="cancelled",
+            stage="已终止",
+            finished_at=datetime.now().isoformat(timespec="seconds"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("backtest %s failed", backtest_id)
+        _append_backtest_log(backtest_id, f"回测失败：{exc}")
+        _set_backtest_status(
+            backtest_id,
+            status="failed",
+            stage="回测失败",
+            finished_at=datetime.now().isoformat(timespec="seconds"),
+            error=str(exc),
+        )
+    finally:
+        _backtest_cancel_events.pop(backtest_id, None)
+
+
 class _RunLogHandler(logging.Handler):
     def __init__(self, run_id: str) -> None:
         super().__init__(level=logging.INFO)
@@ -253,6 +427,10 @@ class _RunLogHandler(logging.Handler):
 
 
 def _stage_from_log(message: str) -> str | None:
+    if "前复权基准" in message:
+        return "更新复权数据"
+    if "增量行情预处理" in message or "增量行情按股票整理" in message or "开始按股票整理增量行情" in message:
+        return "整理增量行情"
     if "SQLite" in message and ("同步" in message or "读取" in message or "整理" in message):
         return "同步/加载数据库"
     if "拉取" in message or "TUShare" in message or "缓存" in message and "加载" not in message:
@@ -388,6 +566,13 @@ def create_run(request: RunRequest) -> RunStatus:
         active = next((run for run in _runs.values() if run.status in {"queued", "running", "cancelling"}), None)
     if active is not None:
         raise HTTPException(status_code=409, detail=f"已有任务正在运行: {active.run_id}")
+    with _backtests_lock:
+        active_backtest = next(
+            (item for item in _backtest_runs.values() if item.status in {"queued", "running", "cancelling"}),
+            None,
+        )
+    if active_backtest is not None:
+        raise HTTPException(status_code=409, detail=f"回测任务正在运行: {active_backtest.backtest_id}")
 
     run_id = uuid.uuid4().hex[:12]
     status = RunStatus(run_id=run_id, status="queued")
@@ -416,9 +601,9 @@ def cancel_run(run_id: str) -> RunStatus:
     if stop_event is None:
         raise HTTPException(status_code=409, detail="run cannot be cancelled")
 
-    stop_event.set()
-    _append_run_log(run_id, "收到终止请求，等待当前步骤安全退出")
     _set_run_status(run_id, status="cancelling", stage="正在终止")
+    _append_run_log(run_id, "收到终止请求，等待当前步骤安全退出")
+    stop_event.set()
     with _runs_lock:
         return _runs[run_id]
 
@@ -457,14 +642,121 @@ def get_latest_candidates(strategy_id: str | None = None) -> dict[str, Any]:
     return _read_json(LATEST_CANDIDATES)
 
 
-@app.post("/api/backtests", status_code=501)
-def create_backtest() -> dict[str, Any]:
-    raise HTTPException(status_code=501, detail="回测接口已预留，交易回测逻辑尚未实现")
+@app.post("/api/backtests", response_model=BacktestStatus)
+def create_backtest(request: BacktestRunRequest) -> BacktestStatus:
+    try:
+        start_date = datetime.strptime(request.start_date, "%Y-%m-%d")
+        end_date = datetime.strptime(request.end_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="日期格式必须为 YYYY-MM-DD") from exc
+    if start_date > end_date:
+        raise HTTPException(status_code=400, detail="开始日期不能晚于结束日期")
+    available = {item.id for item in list_strategies()}
+    if request.strategy_id not in available:
+        raise HTTPException(status_code=400, detail=f"未知策略: {request.strategy_id}")
+
+    with _runs_lock:
+        active_pipeline = next(
+            (item for item in _runs.values() if item.status in {"queued", "running", "cancelling"}),
+            None,
+        )
+    if active_pipeline is not None:
+        raise HTTPException(status_code=409, detail=f"数据/选股任务正在运行: {active_pipeline.run_id}")
+    with _backtests_lock:
+        active = next(
+            (item for item in _backtest_runs.values() if item.status in {"queued", "running", "cancelling"}),
+            None,
+        )
+    if active is not None:
+        raise HTTPException(status_code=409, detail=f"已有回测正在运行: {active.backtest_id}")
+
+    resolved_config = request.config or _load_config()
+    request = request.model_copy(update={"config": resolved_config}) if hasattr(request, "model_copy") else request.copy(update={"config": resolved_config})
+    backtest_id = uuid.uuid4().hex[:12]
+    status = BacktestStatus(
+        backtest_id=backtest_id,
+        strategy_id=request.strategy_id,
+        start_date=request.start_date,
+        end_date=request.end_date,
+        holding_days=request.holding_days,
+        status="queued",
+    )
+    request_payload = request.model_dump(by_alias=True) if hasattr(request, "model_dump") else request.dict(by_alias=True)
+    with _backtests_lock:
+        _backtest_runs[backtest_id] = status
+        _backtest_cancel_events[backtest_id] = threading.Event()
+        _persist_backtest(status, request_payload)
+    threading.Thread(
+        target=_run_backtest_background,
+        args=(backtest_id, request),
+        daemon=True,
+        name=f"backtest-{backtest_id}",
+    ).start()
+    return status
 
 
-@app.get("/api/backtests/{backtest_id}", status_code=501)
-def get_backtest(backtest_id: str) -> dict[str, Any]:
-    raise HTTPException(status_code=501, detail=f"回测接口已预留，尚未实现: {backtest_id}")
+@app.get("/api/backtests/current", response_model=CurrentBacktestResponse)
+def get_current_backtest() -> CurrentBacktestResponse:
+    with _backtests_lock:
+        status = _get_current_backtest_locked()
+    if status is None:
+        stored = db_current_backtest()
+        status = BacktestStatus(**{key: value for key, value in stored.items() if key != "request"}) if stored else None
+    return CurrentBacktestResponse(backtest=status)
+
+
+@app.get("/api/backtests/meta")
+def get_backtest_meta() -> dict[str, Any]:
+    config = _load_config()
+    adjust = str(config.global_.get("adjust", "qfq"))
+    dates = list_trade_dates(adjust)
+    return {
+        "adjust": adjust,
+        "first_date": dates[0] if dates else None,
+        "latest_date": dates[-1] if dates else None,
+        "suggested_start_date": dates[max(0, len(dates) - 60)] if dates else None,
+        "trade_date_count": len(dates),
+    }
+
+
+@app.post("/api/backtests/{backtest_id}/cancel", response_model=BacktestStatus)
+def cancel_backtest(backtest_id: str) -> BacktestStatus:
+    with _backtests_lock:
+        status = _backtest_runs.get(backtest_id)
+        stop_event = _backtest_cancel_events.get(backtest_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="回测任务不存在")
+    if status.status in {"success", "failed", "cancelled"}:
+        return status
+    if stop_event is None:
+        raise HTTPException(status_code=409, detail="该回测任务无法终止")
+    updated = _set_backtest_status(backtest_id, status="cancelling", stage="正在终止")
+    _append_backtest_log(backtest_id, "收到终止请求，等待当前计算安全退出")
+    stop_event.set()
+    return updated
+
+
+@app.get("/api/backtests/{backtest_id}", response_model=BacktestStatus)
+def get_backtest(backtest_id: str) -> BacktestStatus:
+    with _backtests_lock:
+        status = _backtest_runs.get(backtest_id)
+    if status is None:
+        stored = db_get_backtest(backtest_id)
+        status = BacktestStatus(**{key: value for key, value in stored.items() if key != "request"}) if stored else None
+    if status is None:
+        raise HTTPException(status_code=404, detail="回测任务不存在")
+    return status
+
+
+@app.get("/api/backtests/{backtest_id}/result")
+def get_backtest_result(backtest_id: str) -> dict[str, Any]:
+    result = load_backtest_result(backtest_id)
+    if result is not None:
+        return result
+    status = db_get_backtest(backtest_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="回测任务不存在")
+    raise HTTPException(status_code=409, detail=f"回测尚未产生结果，当前状态: {status['status']}")
 
 
 @app.get("/api/failures/latest")

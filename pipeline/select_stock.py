@@ -60,7 +60,7 @@ def _resolve_project_path(path_like: str) -> Path:
     return path if path.is_absolute() else (_ROOT / path)
 
 
-def _load_stock_names(stock_list_file: str) -> Dict[str, str]:
+def load_stock_names(stock_list_file: str) -> Dict[str, str]:
     name_file = _resolve_project_path(stock_list_file)
     if not name_file.exists():
         return {}
@@ -80,7 +80,7 @@ def _resolve_pick_date(data: Dict[str, pd.DataFrame]) -> pd.Timestamp:
     return all_dates[-1]
 
 
-def _market_of_code(code: str) -> str:
+def market_of_code(code: str) -> str:
     code = str(code).zfill(6)
     if code.startswith(("300", "301")):
         return "gem"
@@ -91,14 +91,14 @@ def _market_of_code(code: str) -> str:
     return "main"
 
 
-def _filter_data_by_markets(
+def filter_data_by_markets(
     data: Dict[str, pd.DataFrame],
     markets: list[str] | None,
 ) -> Dict[str, pd.DataFrame]:
     selected = set(markets or _ALL_MARKETS)
     if not selected or selected == _ALL_MARKETS:
         return data
-    return {code: df for code, df in data.items() if _market_of_code(code) in selected}
+    return {code: df for code, df in data.items() if market_of_code(code) in selected}
 
 
 def run(
@@ -130,7 +130,7 @@ def run(
         return CandidateRun(run_date=datetime.now().strftime("%Y-%m-%d"), pick_date="", meta={"strategy": active_strategy})
 
     raise_if_cancelled(stop_event)
-    data = _filter_data_by_markets(data, markets)
+    data = filter_data_by_markets(data, markets)
     logger.info("板块过滤后剩余 %d 只，markets=%s", len(data), markets)
     if not data:
         logger.error("板块过滤后无可用股票，请调整 markets 配置")
@@ -144,7 +144,7 @@ def run(
     pool = build_top_turnover_pool(data, top_m, pd_ts, stop_event=stop_event)
 
     logger.info("=== 步骤 4/4  运行策略：%s ===", strategy.meta.name)
-    names = _load_stock_names(stock_list_file)
+    names = load_stock_names(stock_list_file)
     context = StrategyContext(
         pick_date=pd_ts,
         names=names,
@@ -154,7 +154,7 @@ def run(
     )
     candidates = strategy.select(data, strategy_cfg, context)
     for candidate in candidates:
-        candidate.extra.setdefault("market", _market_of_code(candidate.code))
+        candidate.extra.setdefault("market", market_of_code(candidate.code))
 
     scanned = len([code for code in data if pool is None or code in pool])
     run_result = CandidateRun(

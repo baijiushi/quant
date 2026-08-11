@@ -111,3 +111,101 @@ test("console can save and delete a research evidence note", async ({ page }) =>
   await page.getByRole("button", { name: "删除" }).click();
   await expect(page.getByText("浏览器回归测试素材")).not.toBeVisible();
 });
+
+test("backtest route runs a daily replay and shows ranked returns", async ({ page }) => {
+  const running = {
+    backtest_id: "backtest123",
+    strategy_id: "b1",
+    start_date: "2026-07-01",
+    end_date: "2026-07-10",
+    holding_days: 3,
+    status: "running",
+    stage: "逐日选股",
+    progress: 64,
+    processed_days: 4,
+    total_days: 8,
+    started_at: "2026-07-11T10:00:00",
+    finished_at: null,
+    error: null,
+    logs: ["10:00:01 读取回测行情", "10:00:04 逐日回测 4/8：选出 2 只"]
+  };
+  const completed = {
+    ...running,
+    status: "success",
+    stage: "回测完成",
+    progress: 100,
+    processed_days: 8,
+    finished_at: "2026-07-11T10:00:08",
+    logs: [...running.logs, "10:00:08 回测完成，共 2 条信号"]
+  };
+  const result = {
+    backtest_id: "backtest123",
+    generated_at: "2026-07-11T10:00:08",
+    request: { strategy_id: "b1", strategy_name: "B1 战法", start_date: "2026-07-01", end_date: "2026-07-10", holding_days: 3 },
+    metrics: {
+      signal_count: 2, completed_count: 2, win_count: 1, loss_count: 1,
+      win_rate_pct: 50, average_return_pct: 4.25, median_return_pct: 4.25, profit_loss_ratio: 2.4
+    },
+    horizon_stats: [
+      { day: 1, sample_count: 2, win_rate_pct: 50, average_return_pct: 1.2, median_return_pct: 1.2 },
+      { day: 2, sample_count: 2, win_rate_pct: 50, average_return_pct: 2.4, median_return_pct: 2.4 },
+      { day: 3, sample_count: 2, win_rate_pct: 50, average_return_pct: 4.25, median_return_pct: 4.25 }
+    ],
+    daily_stats: [{ signal_date: "2026-07-01", selected_count: 2, completed_count: 2, win_rate_pct: 50, average_return_pct: 4.25 }],
+    stock_ranking: [
+      { rank: 1, code: "000001", name: "平安银行", trade_count: 1, win_rate_pct: 100, average_return_pct: 12, best_return_pct: 12, worst_return_pct: 12 }
+    ],
+    trades: [
+      {
+        rank: 1, signal_rank: 1, signal_date: "2026-07-01", code: "000001", name: "平安银行",
+        strategy_score: 8.6, signal_close: 10, entry_date: "2026-07-02", entry_open: 10,
+        exit_date: "2026-07-06", exit_close: 11.2, final_return_pct: 12, max_gain_pct: 14,
+        max_drawdown_pct: -2, status: "completed", note: "按下一交易日开盘买入",
+        daily_returns: [
+          { day: 1, date: "2026-07-02", close: 10.4, return_pct: 4, carried: false },
+          { day: 2, date: "2026-07-03", close: 10.8, return_pct: 8, carried: false },
+          { day: 3, date: "2026-07-06", close: 11.2, return_pct: 12, carried: false }
+        ]
+      },
+      {
+        rank: 2, signal_rank: 2, signal_date: "2026-07-01", code: "000002", name: "万科A",
+        strategy_score: 7.1, signal_close: 8, entry_date: "2026-07-02", entry_open: 8,
+        exit_date: "2026-07-06", exit_close: 7.72, final_return_pct: -3.5, max_gain_pct: 1,
+        max_drawdown_pct: -6, status: "completed", note: "按下一交易日开盘买入",
+        daily_returns: [
+          { day: 1, date: "2026-07-02", close: 7.92, return_pct: -1, carried: false },
+          { day: 2, date: "2026-07-03", close: 7.84, return_pct: -2, carried: false },
+          { day: 3, date: "2026-07-06", close: 7.72, return_pct: -3.5, carried: false }
+        ]
+      }
+    ],
+    meta: { assumptions: ["下一市场交易日开盘价买入"] }
+  };
+
+  await page.route("**/api/backtests/current", (route) => route.fulfill({ json: { backtest: null } }));
+  await page.route("**/api/backtests/meta", (route) => route.fulfill({ json: { first_date: "2025-01-01", latest_date: "2026-07-10", suggested_start_date: "2026-05-01" } }));
+  await page.route("**/api/backtests/backtest123/result", (route) => route.fulfill({ json: result }));
+  await page.route("**/api/backtests/backtest123", (route) => route.fulfill({ json: completed }));
+  await page.route("**/api/backtests", async (route) => {
+    expect(route.request().method()).toBe("POST");
+    const payload = route.request().postDataJSON();
+    expect(payload.holding_days).toBe(3);
+    await route.fulfill({ json: running });
+  });
+
+  await page.goto("/backtest");
+  await expect(page.getByRole("heading", { name: "逐日选股回测" })).toBeVisible();
+  await page.getByLabel("开始日期").fill("2026-07-01");
+  await page.getByLabel("结束日期").fill("2026-07-10");
+  await page.getByLabel("持有交易日 X").fill("3");
+  await page.getByRole("button", { name: "开始逐日回测" }).click();
+
+  await expect(page.getByText("回测完成，共 2 条信号")).toBeVisible();
+  await expect(page.getByText("+12.00%").first()).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "D3" })).toBeVisible();
+  await expect(page.getByText("平安银行").first()).toBeVisible();
+  await page.getByRole("button", { name: "每日汇总" }).click();
+  await expect(page.getByRole("columnheader", { name: "选出数量" })).toBeVisible();
+  await page.getByRole("button", { name: "个股排行" }).click();
+  await expect(page.getByRole("columnheader", { name: "出现次数" })).toBeVisible();
+});

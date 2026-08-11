@@ -67,7 +67,12 @@ class VolumeNewHighStrategy:
             int(cfg["volume_ma_window"]),
         ) + 5
 
-    def prepare_all(self, data: Dict[str, pd.DataFrame], cfg: dict) -> Dict[str, pd.DataFrame]:
+    def prepare_all(
+        self,
+        data: Dict[str, pd.DataFrame],
+        cfg: dict,
+        context: StrategyContext | None = None,
+    ) -> Dict[str, pd.DataFrame]:
         cfg = self._cfg(cfg)
         prepared: Dict[str, pd.DataFrame] = {}
         corr_window = int(cfg["corr_window"])
@@ -75,7 +80,11 @@ class VolumeNewHighStrategy:
         high_window = int(cfg["new_high_window"])
         volume_window = int(cfg["volume_ma_window"])
 
-        for code, df in data.items():
+        total = len(data)
+        logger.info("缩量新高指标预计算开始：%d 只股票", total)
+        for index, (code, df) in enumerate(data.items(), 1):
+            if context and context.cancel_requested and context.cancel_requested():
+                raise RunCancelledError("任务已被用户终止")
             try:
                 item = df.copy()
                 volume = item["volume"] if "volume" in item.columns else pd.Series(0.0, index=item.index)
@@ -88,6 +97,11 @@ class VolumeNewHighStrategy:
                 prepared[code] = item
             except Exception as exc:
                 logger.debug("volume_new_high prepare failed %s: %s", code, exc)
+            if (not context or context.progress_enabled) and (index % 250 == 0 or index == total):
+                message = f"缩量新高指标预计算进度 {index}/{total}，成功 {len(prepared)} 只"
+                logger.info(message)
+                if context and context.progress_callback:
+                    context.progress_callback(message, index, total)
         return prepared
 
     def _add_cross_section_rank(
@@ -122,22 +136,41 @@ class VolumeNewHighStrategy:
             logger.info("缩量新高策略已禁用")
             return []
 
-        prepared_data = self.prepare_all(data, cfg)
+        prepared_data = self.prepare_all(data, cfg, context)
+        return self.select_prepared(prepared_data, cfg, context)
+
+    def select_prepared(
+        self,
+        data: Dict[str, pd.DataFrame],
+        cfg: dict,
+        context: StrategyContext,
+    ) -> list[Candidate]:
+        cfg = self._cfg(cfg)
+        if not cfg.get("enabled", True):
+            return []
+
+        prepared_data = data
         self._add_cross_section_rank(prepared_data, context.pick_date)
         warmup = self.warmup_bars(cfg)
         candidates: list[Candidate] = []
         skipped = 0
         processed = 0
 
-        for code, df in tqdm(prepared_data.items(), desc="缩量新高选股", unit="只"):
+        for code, df in tqdm(
+            prepared_data.items(),
+            desc="缩量新高选股",
+            unit="只",
+            disable=not context.progress_enabled,
+        ):
             if context.cancel_requested and context.cancel_requested():
                 raise RunCancelledError("任务已被用户终止")
             processed += 1
-            if processed % 250 == 0 or processed == len(prepared_data):
+            if context.progress_enabled and (processed % 250 == 0 or processed == len(prepared_data)):
                 logger.info("缩量新高进度 %d/%d，当前命中 %d 只，跳过 %d 只", processed, len(prepared_data), len(candidates), skipped)
             if context.pool is not None and code not in context.pool:
                 continue
-            if len(df) < warmup or context.pick_date not in df.index:
+            history_bars = int(df.index.searchsorted(context.pick_date, side="right"))
+            if history_bars < warmup or context.pick_date not in df.index:
                 skipped += 1
                 continue
             row = df.loc[context.pick_date]

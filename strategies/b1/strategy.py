@@ -111,7 +111,10 @@ class B1Strategy:
             except Exception as exc:
                 logger.debug("B1 prepare failed %s: %s", code, exc)
             if index % 250 == 0 or index == total:
-                logger.info("B1 指标预计算进度 %d/%d，成功 %d 只", index, total, len(prepared))
+                message = f"B1 指标预计算进度 {index}/{total}，成功 {len(prepared)} 只"
+                logger.info(message)
+                if context and context.progress_callback:
+                    context.progress_callback(message, index, total)
         return prepared
 
     def _passes(self, row: pd.Series, cfg: dict) -> bool:
@@ -149,24 +152,47 @@ class B1Strategy:
             logger.info("B1 策略已禁用")
             return []
 
-        warmup = self.warmup_bars(cfg)
         selected_data = (
             data
             if context.pool is None
             else {code: frame for code, frame in data.items() if code in context.pool}
         )
         prepared_data = self.prepare_all(selected_data, cfg, context)
+        return self.select_prepared(prepared_data, cfg, context)
+
+    def select_prepared(
+        self,
+        data: Dict[str, pd.DataFrame],
+        cfg: dict,
+        context: StrategyContext,
+    ) -> list[Candidate]:
+        cfg = self._cfg(cfg)
+        if not cfg.get("enabled", True):
+            return []
+
+        warmup = self.warmup_bars(cfg)
         candidates: list[Candidate] = []
         skipped = 0
         processed = 0
+        prepared_data = (
+            data
+            if context.pool is None
+            else {code: frame for code, frame in data.items() if code in context.pool}
+        )
 
-        for code, df in tqdm(prepared_data.items(), desc="B1 选股", unit="只"):
+        for code, df in tqdm(
+            prepared_data.items(),
+            desc="B1 选股",
+            unit="只",
+            disable=not context.progress_enabled,
+        ):
             if context.cancel_requested and context.cancel_requested():
                 raise RunCancelledError("任务已被用户终止")
             processed += 1
-            if processed % 250 == 0 or processed == len(prepared_data):
+            if context.progress_enabled and (processed % 250 == 0 or processed == len(prepared_data)):
                 logger.info("B1选股进度 %d/%d，当前命中 %d 只，跳过 %d 只", processed, len(prepared_data), len(candidates), skipped)
-            if len(df) < warmup or context.pick_date not in df.index:
+            history_bars = int(df.index.searchsorted(context.pick_date, side="right"))
+            if history_bars < warmup or context.pick_date not in df.index:
                 skipped += 1
                 continue
 

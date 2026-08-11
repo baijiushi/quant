@@ -94,6 +94,54 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_candidates_run ON candidates(candidate_run_id, rank_no);
 
+            CREATE TABLE IF NOT EXISTS backtest_runs (
+                backtest_id TEXT PRIMARY KEY,
+                strategy_id TEXT NOT NULL,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                holding_days INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                progress REAL NOT NULL DEFAULT 0,
+                processed_days INTEGER NOT NULL DEFAULT 0,
+                total_days INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
+                finished_at TEXT,
+                error TEXT,
+                logs_json TEXT NOT NULL DEFAULT '[]',
+                request_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_backtest_runs_updated ON backtest_runs(updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS backtest_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                backtest_id TEXT NOT NULL REFERENCES backtest_runs(backtest_id) ON DELETE CASCADE,
+                rank_no INTEGER NOT NULL,
+                signal_rank INTEGER NOT NULL,
+                signal_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                strategy_score REAL NOT NULL,
+                signal_close REAL NOT NULL,
+                entry_date TEXT,
+                entry_open REAL,
+                exit_date TEXT,
+                exit_close REAL,
+                holding_days INTEGER NOT NULL,
+                final_return_pct REAL,
+                max_gain_pct REAL,
+                max_drawdown_pct REAL,
+                status TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                daily_returns_json TEXT NOT NULL DEFAULT '[]',
+                extra_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_backtest_trades_rank ON backtest_trades(backtest_id, rank_no);
+            CREATE INDEX IF NOT EXISTS idx_backtest_trades_signal ON backtest_trades(backtest_id, signal_date);
+
             CREATE TABLE IF NOT EXISTS research_documents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
@@ -235,6 +283,157 @@ def mark_interrupted_runs() -> None:
                WHERE status IN ('queued','running','cancelling')""",
             (now, now),
         )
+        conn.execute(
+            """UPDATE backtest_runs SET status='failed', stage='服务重启中断',
+               finished_at=?, error=COALESCE(error, '后端服务重启，未完成的回测任务已停止'), updated_at=?
+               WHERE status IN ('queued','running','cancelling')""",
+            (now, now),
+        )
+
+
+def upsert_backtest_run(payload: dict[str, Any], request_payload: dict[str, Any] | None = None) -> None:
+    init_db()
+    now = datetime.now().isoformat(timespec="seconds")
+    existing_request = request_payload or payload.get("request") or {}
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO backtest_runs(
+                backtest_id,strategy_id,start_date,end_date,holding_days,status,stage,progress,
+                processed_days,total_days,started_at,finished_at,error,logs_json,request_json,result_json,updated_at
+            ) VALUES(
+                :backtest_id,:strategy_id,:start_date,:end_date,:holding_days,:status,:stage,:progress,
+                :processed_days,:total_days,:started_at,:finished_at,:error,:logs_json,:request_json,:result_json,:updated_at
+            )
+            ON CONFLICT(backtest_id) DO UPDATE SET
+                status=excluded.status,stage=excluded.stage,progress=excluded.progress,
+                processed_days=excluded.processed_days,total_days=excluded.total_days,
+                started_at=excluded.started_at,finished_at=excluded.finished_at,error=excluded.error,
+                logs_json=excluded.logs_json,
+                request_json=CASE WHEN excluded.request_json='{}' THEN backtest_runs.request_json ELSE excluded.request_json END,
+                result_json=COALESCE(excluded.result_json,backtest_runs.result_json),updated_at=excluded.updated_at
+            """,
+            {
+                "backtest_id": payload["backtest_id"],
+                "strategy_id": payload.get("strategy_id", existing_request.get("strategy_id", "unknown")),
+                "start_date": payload.get("start_date", existing_request.get("start_date", "")),
+                "end_date": payload.get("end_date", existing_request.get("end_date", "")),
+                "holding_days": int(payload.get("holding_days", existing_request.get("holding_days", 5))),
+                "status": payload.get("status", "queued"),
+                "stage": payload.get("stage", "等待开始"),
+                "progress": float(payload.get("progress", 0) or 0),
+                "processed_days": int(payload.get("processed_days", 0) or 0),
+                "total_days": int(payload.get("total_days", 0) or 0),
+                "started_at": payload.get("started_at"),
+                "finished_at": payload.get("finished_at"),
+                "error": payload.get("error"),
+                "logs_json": _json(payload.get("logs", [])),
+                "request_json": _json(existing_request),
+                "result_json": _json(payload.get("result")) if payload.get("result") is not None else None,
+                "updated_at": now,
+            },
+        )
+
+
+def _backtest_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "backtest_id": row["backtest_id"],
+        "strategy_id": row["strategy_id"],
+        "start_date": row["start_date"],
+        "end_date": row["end_date"],
+        "holding_days": row["holding_days"],
+        "status": row["status"],
+        "stage": row["stage"],
+        "progress": row["progress"],
+        "processed_days": row["processed_days"],
+        "total_days": row["total_days"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "error": row["error"],
+        "logs": _decode(row["logs_json"], []),
+        "request": _decode(row["request_json"], {}),
+        "result": _decode(row["result_json"], None),
+    }
+
+
+def get_backtest_run(backtest_id: str) -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        row = conn.execute("SELECT * FROM backtest_runs WHERE backtest_id=?", (backtest_id,)).fetchone()
+    return _backtest_row(row) if row else None
+
+
+def get_current_backtest_run() -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM backtest_runs
+               ORDER BY CASE WHEN status IN ('queued','running','cancelling') THEN 0 ELSE 1 END, updated_at DESC
+               LIMIT 1"""
+        ).fetchone()
+    return _backtest_row(row) if row else None
+
+
+def save_backtest_result(backtest_id: str, result: dict[str, Any]) -> None:
+    init_db()
+    trades = list(result.get("trades") or [])
+    summary = dict(result)
+    summary.pop("trades", None)
+    now = datetime.now().isoformat(timespec="seconds")
+    with _connect() as conn:
+        conn.execute("DELETE FROM backtest_trades WHERE backtest_id=?", (backtest_id,))
+        conn.executemany(
+            """INSERT INTO backtest_trades(
+                   backtest_id,rank_no,signal_rank,signal_date,code,name,strategy_id,strategy_score,signal_close,
+                   entry_date,entry_open,exit_date,exit_close,holding_days,final_return_pct,max_gain_pct,
+                   max_drawdown_pct,status,note,daily_returns_json,extra_json
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [
+                (
+                    backtest_id, int(item.get("rank", index)), int(item.get("signal_rank", 0)),
+                    item.get("signal_date", ""), str(item.get("code", "")).zfill(6), item.get("name", ""),
+                    item.get("strategy_id", ""), float(item.get("strategy_score", 0) or 0),
+                    float(item.get("signal_close", 0) or 0), item.get("entry_date"), item.get("entry_open"),
+                    item.get("exit_date"), item.get("exit_close"), int(item.get("holding_days", 0) or 0),
+                    item.get("final_return_pct"), item.get("max_gain_pct"), item.get("max_drawdown_pct"),
+                    item.get("status", "pending"), item.get("note", ""), _json(item.get("daily_returns", [])),
+                    _json(item.get("extra", {})),
+                )
+                for index, item in enumerate(trades, 1)
+            ],
+        )
+        conn.execute(
+            "UPDATE backtest_runs SET result_json=?, updated_at=? WHERE backtest_id=?",
+            (_json(summary), now, backtest_id),
+        )
+
+
+def load_backtest_result(backtest_id: str) -> dict[str, Any] | None:
+    init_db()
+    with _connect() as conn:
+        run = conn.execute("SELECT result_json FROM backtest_runs WHERE backtest_id=?", (backtest_id,)).fetchone()
+        if not run or not run["result_json"]:
+            return None
+        rows = conn.execute(
+            "SELECT * FROM backtest_trades WHERE backtest_id=? ORDER BY rank_no",
+            (backtest_id,),
+        ).fetchall()
+    result = _decode(run["result_json"], {})
+    result["trades"] = [
+        {
+            "rank": row["rank_no"], "signal_rank": row["signal_rank"], "signal_date": row["signal_date"],
+            "code": row["code"], "name": row["name"], "strategy_id": row["strategy_id"],
+            "strategy_score": row["strategy_score"], "signal_close": row["signal_close"],
+            "entry_date": row["entry_date"], "entry_open": row["entry_open"],
+            "exit_date": row["exit_date"], "exit_close": row["exit_close"],
+            "holding_days": row["holding_days"], "final_return_pct": row["final_return_pct"],
+            "max_gain_pct": row["max_gain_pct"], "max_drawdown_pct": row["max_drawdown_pct"],
+            "status": row["status"], "note": row["note"],
+            "daily_returns": _decode(row["daily_returns_json"], []), "extra": _decode(row["extra_json"], {}),
+        }
+        for row in rows
+    ]
+    return result
 
 
 def _pipeline_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -556,17 +755,31 @@ def upsert_price_batch(prices: dict[str, pd.DataFrame], adjust: str) -> None:
     now = datetime.now().isoformat(timespec="seconds")
     items = list(prices.items())
     total = len(items)
+    total_rows = sum(len(frame) for _, frame in items if frame is not None)
     chunk_size = 250
+    logger.info("SQLite 行情同步开始：%d 只股票，共 %d 条记录", total, total_rows)
+    written_rows = 0
     for offset in range(0, total, chunk_size):
         chunk = items[offset : offset + chunk_size]
+        chunk_rows = 0
         with _connect() as conn:
             for code, frame in chunk:
                 rows = _price_rows(code, adjust, frame, now)
                 if rows:
                     conn.executemany(_UPSERT_PRICE_SQL, rows)
+                    chunk_rows += len(rows)
+        written_rows += chunk_rows
         # The run log handler writes pipeline status to the same database, so log
         # only after the price transaction has committed and released its lock.
-        logger.info("SQLite 行情同步进度 %d/%d", min(offset + len(chunk), total), total)
+        completed = min(offset + len(chunk), total)
+        logger.info(
+            "SQLite 行情同步进度 %d/%d（%.1f%%），已写入 %d/%d 条",
+            completed,
+            total,
+            completed / total * 100 if total else 100.0,
+            written_rows,
+            total_rows,
+        )
 
 
 def price_codes(adjust: str) -> set[str]:
@@ -583,14 +796,29 @@ def rescale_qfq_history(ratios: dict[str, float], before_date: str) -> int:
         return 0
     init_db()
     updated = 0
-    with _connect() as conn:
-        for code, ratio in effective.items():
-            cur = conn.execute(
-                """UPDATE daily_prices SET open=open*?, high=high*?, low=low*?, close=close*?, updated_at=?
-                   WHERE code=? AND adjust='qfq' AND trade_date<=?""",
-                (ratio, ratio, ratio, ratio, datetime.now().isoformat(timespec="seconds"), code, before_date),
-            )
-            updated += int(cur.rowcount or 0)
+    items = list(effective.items())
+    total = len(items)
+    chunk_size = 100
+    logger.info("开始更新前复权基准：%d 只股票，截止 %s", total, before_date)
+    for offset in range(0, total, chunk_size):
+        chunk = items[offset : offset + chunk_size]
+        with _connect() as conn:
+            for code, ratio in chunk:
+                cur = conn.execute(
+                    """UPDATE daily_prices SET open=open*?, high=high*?, low=low*?, close=close*?, updated_at=?
+                       WHERE code=? AND adjust='qfq' AND trade_date<=?""",
+                    (ratio, ratio, ratio, ratio, datetime.now().isoformat(timespec="seconds"), code, before_date),
+                )
+                updated += int(cur.rowcount or 0)
+        # Log after committing so the web run logger can persist status safely.
+        completed = min(offset + len(chunk), total)
+        logger.info(
+            "前复权基准更新进度 %d/%d（%.1f%%），累计重标 %d 条",
+            completed,
+            total,
+            completed / total * 100,
+            updated,
+        )
     logger.info("前复权基准更新：%d 只股票，重标 %d 条历史行情", len(effective), updated)
     return updated
 
@@ -637,7 +865,29 @@ def market_turnover_snapshot(adjust: str = "qfq", trade_date: str | None = None)
     }
 
 
-def load_daily_prices(adjust: str, n_turnover_days: int, symbols: list[str] | None = None) -> dict[str, pd.DataFrame]:
+def list_trade_dates(adjust: str, start_date: str | None = None, end_date: str | None = None) -> list[str]:
+    init_db()
+    clauses = ["adjust=?"]
+    params: list[Any] = [adjust or "bfq"]
+    if start_date:
+        clauses.append("trade_date>=?")
+        params.append(start_date)
+    if end_date:
+        clauses.append("trade_date<=?")
+        params.append(end_date)
+    query = "SELECT DISTINCT trade_date FROM daily_prices WHERE " + " AND ".join(clauses) + " ORDER BY trade_date"
+    with _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [str(row["trade_date"]) for row in rows]
+
+
+def load_daily_prices(
+    adjust: str,
+    n_turnover_days: int,
+    symbols: list[str] | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, pd.DataFrame]:
     """Read normalized OHLCV data for strategies, including the derived turnover_n column."""
     init_db()
     clauses = ["adjust=?"]
@@ -646,6 +896,12 @@ def load_daily_prices(adjust: str, n_turnover_days: int, symbols: list[str] | No
         codes = [str(code).zfill(6) for code in symbols]
         clauses.append(f"code IN ({','.join('?' for _ in codes)})")
         params.extend(codes)
+    if start_date:
+        clauses.append("trade_date>=?")
+        params.append(start_date)
+    if end_date:
+        clauses.append("trade_date<=?")
+        params.append(end_date)
     query = "SELECT * FROM daily_prices WHERE " + " AND ".join(clauses) + " ORDER BY code, trade_date"
     logger.info("SQLite 开始读取标准行情，adjust=%s", adjust)
     with _connect() as conn:

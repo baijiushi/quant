@@ -7,6 +7,7 @@
 - `run_all.py` 保留为命令行入口。
 - `backend/app.py` 提供本地 FastAPI 服务。
 - `web/` 提供 Vue 3 + Vite + TypeScript 控制台。
+- `/backtest` 提供独立的逐日选股回测页面和收益排行。
 - 多策略架构支持 `b1` 和 `volume_new_high`，策略通过统一注册表和标准 OHLCV 数据调用。
 - B1 策略支持 KDJ、日线均线多头、周线确认、MACD、成交量过滤、板块过滤。
 - 缩量新高策略实现 `-corr(HIGH, VOLUME, 10) * rank(stddev(HIGH, 10))`，并支持新高窗口、缩量阈值和最低评分参数。
@@ -200,6 +201,25 @@ python scripts/migrate_to_sqlite.py
 
 本次迁移已安全完成。之后 TUShare 增量获取会自动按“股票代码 + 复权方式 + 交易日”写入数据库，策略优先从 SQLite 加载行情；CSV 仍保留为兼容回退。
 
+## 策略回测
+
+启动控制台后访问：
+
+```text
+http://127.0.0.1:8000/backtest
+```
+
+回测页与选股控制台使用独立路由。可以选择 B1 或缩量新高策略、开始/结束日期、持有交易日、板块、流动性池和策略参数。任务会一次性加载所需行情并预计算指标，再按每个交易日运行策略；状态、日志、统计摘要和逐笔结果均保存到 `data/oversell.db`，刷新页面后可以恢复。
+
+交易与统计口径：
+
+- 选股日收盘后产生信号，只使用当日及以前的数据。
+- 下一市场交易日按该股票开盘价买入；停牌或缺少开盘价时标记为“未成交”。
+- D1 表示买入当天收盘收益，最终收益按第 X 个市场交易日收盘价计算。
+- 胜率按完整且可成交的交易计算；盈亏比为平均盈利除以平均亏损绝对值。
+- 页面提供逐笔收益排行、每日汇总、个股排行和 D1 至 DX 持有期表现，并支持导出 CSV。
+- 当前每条信号独立统计，暂不模拟资金仓位，也不计佣金、印花税、滑点和涨跌停无法成交。
+
 ## 浏览器自动化测试
 
 安装 Playwright 浏览器后运行：
@@ -236,7 +256,11 @@ scripts\test_browser.bat
 - `GET` / `POST` / `DELETE /api/research/documents`：管理 AI 赛道评分使用的研究素材。
 - `GET /api/knowledge/benben/status` / `GET /api/knowledge/benben/documents`：查看方法论知识库状态和证据。
 - `POST /api/knowledge/benben/refresh`：强制刷新公开 B 站合集目录。
-- `POST /api/backtests` / `GET /api/backtests/{id}`：回测接口已预留，当前返回未实现。
+- `GET /api/backtests/meta`：读取本地行情日期范围和建议回测起点。
+- `POST /api/backtests`：启动逐日选股回测。
+- `GET /api/backtests/current` / `GET /api/backtests/{id}`：恢复或查询回测任务与进度。
+- `POST /api/backtests/{id}/cancel`：安全终止正在运行的回测。
+- `GET /api/backtests/{id}/result`：读取胜率、盈亏比、持有期统计和交易排行。
 
 ## 风险提示
 
