@@ -32,6 +32,7 @@ from ai_scoring.knowledge import (
 from backtest.schemas import BacktestRequest as BacktestServiceRequest
 from backtest.service import run_backtest
 from entry_analysis import build_daily_entry_plan
+from market_analysis import calculate_market_breadth
 from pipeline.cancellation import RunCancelledError
 from pipeline.runtime import DATA_MODES, run_pipeline
 from pipeline.select_stock import normalize_strategy_config
@@ -113,6 +114,7 @@ class BacktestRunRequest(BaseModel):
     start_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     end_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     holding_days: int = Field(default=5, ge=1, le=60)
+    holding_periods: list[int] = Field(default_factory=list)
     config: ConfigPayload | None = None
 
 
@@ -122,6 +124,7 @@ class BacktestStatus(BaseModel):
     start_date: str
     end_date: str
     holding_days: int
+    holding_periods: list[int] = Field(default_factory=list)
     status: Literal["queued", "running", "cancelling", "success", "failed", "cancelled"]
     stage: str = "等待开始"
     progress: float = 0
@@ -368,6 +371,7 @@ def _run_backtest_background(backtest_id: str, request: BacktestRunRequest) -> N
             start_date=request.start_date,
             end_date=request.end_date,
             holding_days=request.holding_days,
+            holding_periods=request.holding_periods,
             config=config_payload,
         )
         result = run_backtest(
@@ -558,6 +562,33 @@ def get_strategies() -> dict[str, Any]:
     }
 
 
+@app.get("/api/market/breadth")
+def get_market_breadth(
+    as_of: str | None = None,
+    adjust: str | None = None,
+    markets: str | None = None,
+) -> dict[str, Any]:
+    config = _load_config()
+    resolved_adjust = adjust or str(config.global_.get("adjust", "qfq"))
+    resolved_markets = (
+        [item.strip() for item in markets.split(",") if item.strip()]
+        if markets
+        else list(config.global_.get("markets") or ["main", "gem", "star", "bse"])
+    )
+    allowed_markets = {"main", "gem", "star", "bse"}
+    if not resolved_markets or not set(resolved_markets).issubset(allowed_markets):
+        raise HTTPException(status_code=400, detail="markets 包含未知板块")
+    try:
+        return calculate_market_breadth(
+            adjust=resolved_adjust,
+            end_date=as_of,
+            markets=resolved_markets,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("market breadth calculation failed")
+        raise HTTPException(status_code=500, detail=f"市场宽度计算失败: {exc}") from exc
+
+
 @app.post("/api/runs", response_model=RunStatus)
 def create_run(request: RunRequest) -> RunStatus:
     if request.data_mode not in DATA_MODES:
@@ -640,6 +671,12 @@ def get_latest_candidates(strategy_id: str | None = None) -> dict[str, Any]:
         path = ROOT / "data" / "candidates" / f"candidates_latest_{strategy_id}.json"
         if path.exists():
             return _read_json(path)
+        return {
+            "run_date": "",
+            "pick_date": "",
+            "candidates": [],
+            "meta": {"strategy": strategy_id, "status": "not_found"},
+        }
     return _read_json(LATEST_CANDIDATES)
 
 
@@ -655,6 +692,16 @@ def create_backtest(request: BacktestRunRequest) -> BacktestStatus:
     available = {item.id for item in list_strategies()}
     if request.strategy_id not in available:
         raise HTTPException(status_code=400, detail=f"未知策略: {request.strategy_id}")
+    holding_periods = sorted(set(request.holding_periods or [request.holding_days]))
+    if not holding_periods or any(value < 1 or value > 60 for value in holding_periods):
+        raise HTTPException(status_code=400, detail="持有周期必须在 1 至 60 个交易日之间")
+    if len(holding_periods) > 10:
+        raise HTTPException(status_code=400, detail="一次最多选择 10 个持有周期")
+    request = (
+        request.model_copy(update={"holding_days": max(holding_periods), "holding_periods": holding_periods})
+        if hasattr(request, "model_copy")
+        else request.copy(update={"holding_days": max(holding_periods), "holding_periods": holding_periods})
+    )
 
     with _runs_lock:
         active_pipeline = next(
@@ -680,6 +727,7 @@ def create_backtest(request: BacktestRunRequest) -> BacktestStatus:
         start_date=request.start_date,
         end_date=request.end_date,
         holding_days=request.holding_days,
+        holding_periods=request.holding_periods,
         status="queued",
     )
     request_payload = request.model_dump(by_alias=True) if hasattr(request, "model_dump") else request.dict(by_alias=True)
