@@ -336,12 +336,14 @@ def upsert_backtest_run(payload: dict[str, Any], request_payload: dict[str, Any]
 
 
 def _backtest_row(row: sqlite3.Row) -> dict[str, Any]:
+    request = _decode(row["request_json"], {})
     return {
         "backtest_id": row["backtest_id"],
         "strategy_id": row["strategy_id"],
         "start_date": row["start_date"],
         "end_date": row["end_date"],
         "holding_days": row["holding_days"],
+        "holding_periods": request.get("holding_periods") or [row["holding_days"]],
         "status": row["status"],
         "stage": row["stage"],
         "progress": row["progress"],
@@ -351,7 +353,7 @@ def _backtest_row(row: sqlite3.Row) -> dict[str, Any]:
         "finished_at": row["finished_at"],
         "error": row["error"],
         "logs": _decode(row["logs_json"], []),
-        "request": _decode(row["request_json"], {}),
+        "request": request,
         "result": _decode(row["result_json"], None),
     }
 
@@ -879,6 +881,70 @@ def list_trade_dates(adjust: str, start_date: str | None = None, end_date: str |
     with _connect() as conn:
         rows = conn.execute(query, params).fetchall()
     return [str(row["trade_date"]) for row in rows]
+
+
+def load_market_price_window(
+    adjust: str = "qfq",
+    bars: int = 90,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    """Load a compact, flat market window for cross-sectional breadth calculations."""
+    init_db()
+    safe_bars = max(20, min(int(bars), 400))
+    clauses = ["adjust=?"]
+    params: list[Any] = [adjust or "bfq"]
+    if end_date:
+        clauses.append("trade_date<=?")
+        params.append(end_date)
+    with _connect() as conn:
+        date_rows = conn.execute(
+            "SELECT DISTINCT trade_date FROM daily_prices WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY trade_date DESC LIMIT ?",
+            [*params, safe_bars],
+        ).fetchall()
+        dates = sorted(str(row["trade_date"]) for row in date_rows)
+        if not dates:
+            return pd.DataFrame(columns=["code", "trade_date", "high", "low", "close", "pct_chg"])
+        frame = pd.read_sql_query(
+            """SELECT code, trade_date, high, low, close, pct_chg
+               FROM daily_prices
+               WHERE adjust=? AND trade_date>=? AND trade_date<=?
+               ORDER BY code, trade_date""",
+            conn,
+            params=(adjust or "bfq", dates[0], dates[-1]),
+        )
+    return frame
+
+
+def daily_price_fingerprint(adjust: str, start_date: str, end_date: str) -> dict[str, Any]:
+    """Return a cheap data-version fingerprint for backtest indicator caches."""
+    init_db()
+    with _connect() as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) AS row_count,
+                      COUNT(DISTINCT code) AS code_count,
+                      MIN(trade_date) AS first_date,
+                      MAX(trade_date) AS latest_date,
+                      MAX(updated_at) AS latest_update,
+                      ROUND(SUM(open), 4) AS open_sum,
+                      ROUND(SUM(high), 4) AS high_sum,
+                      ROUND(SUM(low), 4) AS low_sum,
+                      ROUND(SUM(close), 4) AS close_sum,
+                      ROUND(SUM(volume), 4) AS volume_sum,
+                      ROUND(SUM(amount), 4) AS amount_sum
+               FROM daily_prices
+               WHERE adjust=? AND trade_date>=? AND trade_date<=?""",
+            (adjust or "bfq", start_date, end_date),
+        ).fetchone()
+    return {
+        "row_count": int(row["row_count"] or 0),
+        "code_count": int(row["code_count"] or 0),
+        "first_date": row["first_date"],
+        "latest_date": row["latest_date"],
+        "latest_update": row["latest_update"],
+        "value_sums": [row["open_sum"], row["high_sum"], row["low_sum"], row["close_sum"], row["volume_sum"], row["amount_sum"]],
+    }
 
 
 def load_daily_prices(
