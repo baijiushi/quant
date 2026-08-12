@@ -44,6 +44,8 @@ data/ai_scoring/
 data/news_inputs/
 data/knowledge/
 .playwright-cli/
+.research/
+.tools/
 data/stocklist.csv
 data/oversell.db
 data/oversell.db-*
@@ -52,6 +54,12 @@ data/oversell.db-*
 web/node_modules/
 web/dist/
 web/.vite/
+web/test-results/
+web/playwright-report/
+
+# Local agent/editor settings
+.codex/
+.cursor/
 
 # Logs
 *.log
