@@ -11,6 +11,7 @@
 - 多策略架构支持 `b1` 和 `volume_new_high`，策略通过统一注册表和标准 OHLCV 数据调用。
 - B1 策略支持 KDJ、日线均线多头、周线确认、MACD、成交量过滤、板块过滤。
 - 缩量新高策略实现 `-corr(HIGH, VOLUME, 10) * rank(stddev(HIGH, 10))`，并支持新高窗口、缩量阈值和最低评分参数。
+- 候选股详情逐日扫描最近 60 个交易日的“趋势 -> 截取 -> 入场”历史机会，展示每个入场点当时的结构止损、目标盈亏比及后续结果，并把点标在实际交易日；该结果是历史复盘，不是当前买入推荐。[实现边界与 SMT 数据要求](docs/SMT_TREND_CAPTURE.md)单独说明。
 - 数据模式支持 `existing`、`incremental`、`refresh`、`cache-only`。
 - DeepSeek AI 评分支持赛道景气度分析和候选股“超景气价值投机”评分。
 - SQLite 会保存股票列表、TUShare 日线、任务记录、候选结果、AI 评分和研究素材；CSV/YAML 保留为缓存与可编辑配置。
@@ -247,6 +248,7 @@ scripts\test_browser.bat
 - `POST /api/runs`：启动任务，可传 `strategy_id`。
 - `POST /api/runs/{run_id}/cancel`：终止正在运行的任务。
 - `GET /api/candidates/latest?strategy_id=b1`：读取指定策略最新结果。
+- `GET /api/stocks/{code}/entry-plan`：使用 SQLite 日线逐日扫描最近 60 个交易日的历史截取/入场点，并评价止盈止损结果；可用 `review_bars` 调整观察窗口。
 - `GET /api/ai/sector-scores/latest` / `POST /api/ai/sector-scores/refresh`：读取或更新赛道景气度评分。
 - `GET /api/ai/candidate-scores/latest` / `POST /api/ai/candidate-scores/score`：读取或生成候选股 AI 评分。
 - `GET /api/ai/model`：读取当前 DeepSeek 模型、思考强度和联网检索默认配置。

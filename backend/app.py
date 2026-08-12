@@ -31,6 +31,7 @@ from ai_scoring.knowledge import (
 )
 from backtest.schemas import BacktestRequest as BacktestServiceRequest
 from backtest.service import run_backtest
+from entry_analysis import build_daily_entry_plan
 from pipeline.cancellation import RunCancelledError
 from pipeline.runtime import DATA_MODES, run_pipeline
 from pipeline.select_stock import normalize_strategy_config
@@ -822,6 +823,53 @@ def get_stock_kline(code: str, adjust: str = "qfq", limit: int = 180) -> dict[st
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
     df = df.fillna(0)
     return {"code": safe_code, "rows": df.to_dict(orient="records")}
+
+
+@app.get("/api/stocks/{code}/entry-plan")
+def get_stock_entry_plan(
+    code: str,
+    adjust: str = "qfq",
+    as_of: str | None = None,
+    account_value: float = 100_000,
+    risk_pct: float = 0.5,
+    reward_risk: float = 1.0,
+    atr_window: int = 14,
+    swing_window: int = 2,
+    review_bars: int = 60,
+) -> dict[str, Any]:
+    safe_code = str(code).zfill(6)
+    database_data = load_daily_prices(adjust, 1, [safe_code], end_date=as_of)
+    frame = database_data.get(safe_code)
+    if frame is None or frame.empty:
+        kline = get_stock_kline(safe_code, adjust=adjust, limit=1000)
+        frame = pd.DataFrame(kline["rows"])
+
+    stock_name = ""
+    stocks = load_stocks()
+    if not stocks.empty:
+        code_column = next((item for item in ["code", "代码", "symbol", "ts_code"] if item in stocks.columns), None)
+        name_column = next((item for item in ["name", "名称", "股票简称"] if item in stocks.columns), None)
+        if code_column and name_column:
+            normalized_codes = stocks[code_column].astype(str).str.extract(r"(\d{6})", expand=False).fillna("")
+            match = stocks.loc[normalized_codes == safe_code]
+            if not match.empty:
+                stock_name = str(match.iloc[0][name_column])
+
+    try:
+        return build_daily_entry_plan(
+            frame,
+            code=safe_code,
+            name=stock_name,
+            as_of=as_of,
+            account_value=account_value,
+            risk_pct=risk_pct,
+            reward_risk=reward_risk,
+            atr_window=atr_window,
+            swing_window=swing_window,
+            review_bars=review_bars,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/ai/sector-scores/latest")

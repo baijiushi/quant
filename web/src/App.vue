@@ -67,6 +67,36 @@ interface KlineRow {
   amount?: number;
 }
 
+interface HistoricalEntrySignal {
+  signal_date: string;
+  entry_price: number;
+  stop_price: number;
+  target_price: number;
+  planned_reward_risk: number;
+  risk_pct_of_entry: number;
+  target_return_pct: number;
+  outcome: "target" | "stopped" | "ambiguous" | "open" | "invalid";
+  outcome_label: string;
+  exit_date?: string | null;
+  realized_r?: number | null;
+}
+
+interface EntryPlan {
+  historical_review: {
+    window_bars: number;
+    start_date: string;
+    end_date: string;
+    signal_count: number;
+    completed_count: number;
+    win_count: number;
+    loss_count: number;
+    win_rate: number | null;
+    signals: HistoricalEntrySignal[];
+  };
+  smt: { status: string; reason: string };
+  warnings: string[];
+}
+
 interface SectorAIScore {
   sector: string;
   score: number;
@@ -152,6 +182,10 @@ const latest = ref<CandidateRun | null>(null);
 const failures = ref<Record<string, unknown> | null>(null);
 const selectedCode = ref("");
 const klineRows = ref<KlineRow[]>([]);
+const entryPlan = ref<EntryPlan | null>(null);
+const entryPlanLoading = ref(false);
+const entryPlanError = ref("");
+const entryRewardRisk = ref(1);
 const chartEl = ref<HTMLDivElement | null>(null);
 const loading = ref(false);
 const message = ref("");
@@ -173,6 +207,7 @@ const researchSaving = ref(false);
 let pollTimer: number | null = null;
 let chartResizeObserver: ResizeObserver | null = null;
 let aiEventSource: EventSource | null = null;
+let entryPlanRequest = 0;
 
 const dimensionNames = ["行业景气度", "业务纯度", "估值水位", "细分行业龙头", "市场辨识度"];
 
@@ -639,6 +674,44 @@ async function loadKline(code: string) {
   }
 }
 
+async function loadEntryPlan(code: string) {
+  const requestId = ++entryPlanRequest;
+  if (!code) {
+    entryPlan.value = null;
+    return;
+  }
+  entryPlanLoading.value = true;
+  entryPlanError.value = "";
+  try {
+    const params = new URLSearchParams({
+      adjust: config.value?.global.adjust ?? "qfq",
+      reward_risk: String(entryRewardRisk.value),
+      review_bars: "60"
+    });
+    const analysisDate = selectedCandidate.value?.date || latest.value?.pick_date || pickDate.value;
+    if (analysisDate) params.set("as_of", analysisDate);
+    const payload = await api<EntryPlan>(`/api/stocks/${code}/entry-plan?${params.toString()}`);
+    if (requestId === entryPlanRequest) entryPlan.value = payload;
+  } catch (error) {
+    if (requestId === entryPlanRequest) {
+      entryPlan.value = null;
+      entryPlanError.value = error instanceof Error ? error.message : String(error);
+    }
+  } finally {
+    if (requestId === entryPlanRequest) entryPlanLoading.value = false;
+  }
+}
+
+function planPrice(value: number | null | undefined): string {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(2) : "-";
+}
+
+function finiteChartPrice(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
 function renderChart() {
   if (!chartEl.value || !klineRows.value.length) return;
   const chart = echarts.getInstanceByDom(chartEl.value) ?? echarts.init(chartEl.value);
@@ -646,6 +719,30 @@ function renderChart() {
   const candle = klineRows.value.map((row) => [row.open, row.close, row.low, row.high]);
   const volumeWanShou = klineRows.value.map((row) => (row.volume ?? 0) / 10000);
   const amountYi = klineRows.value.map((row) => (row.amount ?? 0) / 100000);
+  const historySignals = entryPlan.value?.historical_review.signals ?? [];
+  const reviewStart = entryPlan.value?.historical_review.start_date;
+  const reviewStartIndex = reviewStart ? dates.indexOf(reviewStart) : -1;
+  const reviewStartPercent = reviewStartIndex >= 0 && dates.length > 1
+    ? Math.max(0, reviewStartIndex / (dates.length - 1) * 100)
+    : 45;
+  const markPointData: Array<Record<string, unknown>> = [];
+
+  historySignals.forEach((signal, index) => {
+    const entryPrice = finiteChartPrice(signal.entry_price);
+    if (entryPrice === null || !dates.includes(signal.signal_date)) return;
+    const color = signal.outcome === "target"
+      ? "#00897b"
+      : signal.outcome === "stopped" ? "#c62828" : "#1565c0";
+    markPointData.push({
+      name: `历史入场点 ${index + 1}`,
+      coord: [signal.signal_date, entryPrice],
+      value: entryPrice,
+      symbol: "pin",
+      symbolSize: 58,
+      itemStyle: { color, borderColor: "#ffffff", borderWidth: 2 },
+      label: { color: "#ffffff", fontSize: 9, fontWeight: 800, formatter: `历史入场\n${entryPrice.toFixed(2)}` }
+    });
+  });
   chart.resize();
   chart.setOption({
     animation: false,
@@ -697,8 +794,8 @@ function renderChart() {
       }
     ],
     dataZoom: [
-      { type: "inside", xAxisIndex: [0, 1], start: 45, end: 100 },
-      { show: true, xAxisIndex: [0, 1], start: 45, end: 100, bottom: 8, height: 20 }
+      { type: "inside", xAxisIndex: [0, 1], start: reviewStartPercent, end: 100 },
+      { show: true, xAxisIndex: [0, 1], start: reviewStartPercent, end: 100, bottom: 8, height: 20 }
     ],
     series: [
       {
@@ -710,7 +807,8 @@ function renderChart() {
           color0: "#208c71",
           borderColor: "#c94f3d",
           borderColor0: "#208c71"
-        }
+        },
+        markPoint: { silent: true, animation: false, data: markPointData }
       },
       {
         name: "成交量",
@@ -813,13 +911,18 @@ function sourceCountLabel(item: CandidateAIScore): string {
 
 watch(selectedCode, async (code) => {
   if (code) {
-    await loadKline(code);
+    await Promise.all([loadKline(code), loadEntryPlan(code)]);
     await nextTick();
     renderChart();
   }
 });
 
 watch(klineRows, async () => {
+  await nextTick();
+  renderChart();
+});
+
+watch(entryPlan, async () => {
   await nextTick();
   renderChart();
 });
@@ -841,7 +944,7 @@ onMounted(async () => {
     }
     await loadFailures();
     if (selectedCode.value) {
-      await loadKline(selectedCode.value);
+      await Promise.all([loadKline(selectedCode.value), loadEntryPlan(selectedCode.value)]);
     }
     await loadAiModel();
     await loadAiScores();
@@ -1390,8 +1493,50 @@ onUnmounted(() => {
           </div>
         </div>
 
+        <div class="panel entry-review-panel">
+          <div class="panel-title">
+            <div>
+              <p class="entry-kicker">最近 60 个交易日历史复盘</p>
+              <h2>趋势截取入场点检查</h2>
+              <p class="hint">逐日检查最近 60 根 K 线；历史点不是当前买入推荐。</p>
+            </div>
+            <span class="stage-badge">{{ entryPlan?.historical_review.signal_count ?? 0 }} 个历史入场点</span>
+          </div>
+
+          <div class="entry-review-controls">
+            <label class="field">
+              <span>复盘目标盈亏比（R）</span>
+              <input v-model.number="entryRewardRisk" type="number" min="0.5" max="5" step="0.5" />
+            </label>
+            <button :disabled="!selectedCode || entryPlanLoading" @click="loadEntryPlan(selectedCode)">
+              {{ entryPlanLoading ? "计算中" : "重新计算" }}
+            </button>
+          </div>
+
+          <p v-if="entryPlanLoading" class="empty-cell">正在逐日扫描最近 60 个交易日...</p>
+          <p v-else-if="entryPlanError" class="entry-review-error">{{ entryPlanError }}</p>
+          <template v-else-if="entryPlan">
+            <div class="entry-review-summary">
+              <article><span>观察区间</span><strong>{{ entryPlan.historical_review.window_bars }} 日</strong><small>{{ entryPlan.historical_review.start_date }} 至 {{ entryPlan.historical_review.end_date }}</small></article>
+              <article><span>历史入场点</span><strong>{{ entryPlan.historical_review.signal_count }} 个</strong><small>已结束 {{ entryPlan.historical_review.completed_count }} 个</small></article>
+              <article><span>历史结果</span><strong>{{ entryPlan.historical_review.win_count }} 胜 / {{ entryPlan.historical_review.loss_count }} 负</strong><small>胜率 {{ entryPlan.historical_review.win_rate === null ? "样本不足" : `${(entryPlan.historical_review.win_rate * 100).toFixed(1)}%` }}</small></article>
+            </div>
+            <div v-if="entryPlan.historical_review.signals.length" class="entry-review-list">
+              <article v-for="signal in entryPlan.historical_review.signals" :key="signal.signal_date">
+                <div><strong>{{ signal.signal_date }} 历史入场</strong><span>{{ signal.outcome_label }}</span></div>
+                <p>入场 {{ planPrice(signal.entry_price) }} · 止损 {{ planPrice(signal.stop_price) }} · {{ signal.planned_reward_risk }}R 目标 {{ planPrice(signal.target_price) }}</p>
+                <small>下行风险 {{ signal.risk_pct_of_entry.toFixed(2) }}% · 目标涨幅 {{ signal.target_return_pct.toFixed(2) }}%{{ signal.exit_date ? ` · 结果日期 ${signal.exit_date}` : " · 观察期内未结束" }}</small>
+              </article>
+            </div>
+            <p v-else class="empty-cell">最近 60 个交易日没有发现符合当前日线代理规则的入场点。</p>
+            <div class="smt-boundary"><strong>SMT：{{ entryPlan.smt.status }}</strong><p>{{ entryPlan.smt.reason }}</p></div>
+            <ul class="entry-warnings"><li v-for="warning in entryPlan.warnings" :key="warning">{{ warning }}</li></ul>
+          </template>
+        </div>
+
         <div class="panel chart-panel">
           <h2>{{ selectedCandidate?.name ?? "单股图表" }} {{ selectedCode }}</h2>
+          <p class="hint">图钉标在历史信号实际出现的交易日：绿色达到目标，红色止损，蓝色尚未结束或结果不明确。</p>
           <div ref="chartEl" class="chart"></div>
         </div>
 
