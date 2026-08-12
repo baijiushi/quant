@@ -8,13 +8,15 @@
 - `backend/app.py` 提供本地 FastAPI 服务。
 - `web/` 提供 Vue 3 + Vite + TypeScript 控制台。
 - `/backtest` 提供独立的逐日选股回测页面和收益排行。
-- 多策略架构支持 `b1` 和 `volume_new_high`，策略通过统一注册表和标准 OHLCV 数据调用。
+- 多策略架构支持 `b1`、`volume_new_high` 和 `high_52w_momentum`，策略通过统一注册表和标准 OHLCV 数据调用。
 - B1 策略支持 KDJ、日线均线多头、周线确认、MACD、成交量过滤、板块过滤。
 - 缩量新高策略实现 `-corr(HIGH, VOLUME, 10) * rank(stddev(HIGH, 10))`，并支持新高窗口、缩量阈值和最低评分参数。
+- 52 周新高动量策略筛选接近一年高点、半年动量为正且站上趋势均线的股票，并按高点接近度与动量截面排名合成评分。
 - 候选股详情逐日扫描最近 60 个交易日的“趋势 -> 截取 -> 入场”历史机会，展示每个入场点当时的结构止损、目标盈亏比及后续结果，并把点标在实际交易日；该结果是历史复盘，不是当前买入推荐。[实现边界与 SMT 数据要求](docs/SMT_TREND_CAPTURE.md)单独说明。
 - 数据模式支持 `existing`、`incremental`、`refresh`、`cache-only`。
 - DeepSeek AI 评分支持赛道景气度分析和候选股“超景气价值投机”评分。
 - SQLite 会保存股票列表、TUShare 日线、任务记录、候选结果、AI 评分和研究素材；CSV/YAML 保留为缓存与可编辑配置。
+- [可选策略研究索引](docs/strategy-research/README.md)整理了价格动量多因子、质量价值动量、F-Score、低波动与行业景气共振的实现条件和回测重点。
 
 ## 安装
 
@@ -22,6 +24,12 @@ Python 依赖：
 
 ```bash
 pip install -r requirements.txt
+```
+
+运行 Python 测试时再安装开发依赖：
+
+```bash
+pip install -r requirements-dev.txt
 ```
 
 前端依赖：
@@ -61,6 +69,7 @@ python run_all.py --data-mode existing --no-dashboard
 ```bash
 python run_all.py --data-mode existing --strategy-id b1 --no-dashboard
 python run_all.py --data-mode existing --strategy-id volume_new_high --no-dashboard
+python run_all.py --data-mode existing --strategy-id high_52w_momentum --no-dashboard
 ```
 
 增量更新：
@@ -210,7 +219,7 @@ python scripts/migrate_to_sqlite.py
 http://127.0.0.1:8000/backtest
 ```
 
-回测页与选股控制台使用独立路由。可以选择 B1 或缩量新高策略、开始/结束日期、持有交易日、板块、流动性池和策略参数。任务会一次性加载所需行情并预计算指标，再按每个交易日运行策略；状态、日志、统计摘要和逐笔结果均保存到 `data/oversell.db`，刷新页面后可以恢复。
+回测页与选股控制台使用独立路由。可以选择 B1、缩量新高或 52 周新高动量策略、开始/结束日期、板块、流动性池和策略参数，并可同时选择 D3、D5、D10、D15、D20 等多个持有周期。一次任务只扫描一轮信号，再分别统计各周期收益。策略指标会按行情版本和指标参数写入 `data/cache/backtest_indicators/`；相同指标配置再次回测时直接复用，调整持有周期或筛选阈值不会重复预计算。缓存目录不会进入 Git，每个策略最多保留两个版本。状态、日志、统计摘要和逐笔结果均保存到 `data/oversell.db`，刷新页面后可以恢复。
 
 交易与统计口径：
 
@@ -247,6 +256,7 @@ scripts\test_browser.bat
 - `GET /api/config` / `PUT /api/config`：读取或保存全局配置与策略配置。
 - `POST /api/runs`：启动任务，可传 `strategy_id`。
 - `POST /api/runs/{run_id}/cancel`：终止正在运行的任务。
+- `GET /api/market/breadth`：读取市场宽度、风险状态和仓位参考。
 - `GET /api/candidates/latest?strategy_id=b1`：读取指定策略最新结果。
 - `GET /api/stocks/{code}/entry-plan`：使用 SQLite 日线逐日扫描最近 60 个交易日的历史截取/入场点，并评价止盈止损结果；可用 `review_bars` 调整观察窗口。
 - `GET /api/ai/sector-scores/latest` / `POST /api/ai/sector-scores/refresh`：读取或更新赛道景气度评分。
