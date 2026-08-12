@@ -11,7 +11,12 @@ class BacktestRequest:
     start_date: str
     end_date: str
     holding_days: int = 5
+    holding_periods: List[int] = field(default_factory=list)
     config: Dict[str, Any] = field(default_factory=dict)
+
+    def resolved_holding_periods(self) -> List[int]:
+        periods = self.holding_periods or [self.holding_days]
+        return sorted({int(value) for value in periods})
 
 
 @dataclass

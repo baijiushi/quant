@@ -10,6 +10,7 @@ import pandas as pd
 
 import storage.database as database
 import backend.app as backend_app
+import backtest.cache as backtest_cache
 from backtest.schemas import BacktestRequest, BacktestResult
 from backtest.service import run_backtest
 from fastapi.testclient import TestClient
@@ -66,6 +67,9 @@ class BacktestServiceTests(unittest.TestCase):
         self.original_path = database.DB_PATH
         self.tmp = tempfile.TemporaryDirectory()
         database.DB_PATH = Path(self.tmp.name) / "backtest.db"
+        self.original_cache_dir = backtest_cache.CACHE_DIR
+        backtest_cache.CACHE_DIR = Path(self.tmp.name) / "indicator-cache"
+        backtest_cache.clear_memory_cache()
         dates = ["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09"]
         first = _frame([
             (dates[0], 9, 10, 100, 0),
@@ -85,6 +89,8 @@ class BacktestServiceTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         database.DB_PATH = self.original_path
+        backtest_cache.CACHE_DIR = self.original_cache_dir
+        backtest_cache.clear_memory_cache()
         self.tmp.cleanup()
 
     def test_next_open_returns_and_ranking_are_correct(self) -> None:
@@ -134,6 +140,48 @@ class BacktestServiceTests(unittest.TestCase):
         self.assertEqual(loaded["metrics"]["signal_count"], 2)
         self.assertEqual(len(loaded["trades"]), 2)
         self.assertEqual(loaded["trades"][0]["daily_returns"][1]["day"], 2)
+
+    def test_multiple_holding_periods_share_one_signal_scan(self) -> None:
+        strategy = _AlwaysSelectStrategy()
+        request = BacktestRequest(
+            strategy_id="fake", start_date="2026-01-05", end_date="2026-01-05",
+            holding_days=3, holding_periods=[1, 2, 3],
+            config={"global": {"adjust": "qfq", "top_m": 0, "n_turnover_days": 2, "markets": ["main"]}, "strategies": {"fake": {}}},
+        )
+        with patch("backtest.service.get_strategy", return_value=strategy):
+            result = run_backtest("multi-period", request)
+
+        self.assertEqual(result.request["holding_periods"], [1, 2, 3])
+        self.assertEqual([item["day"] for item in result.horizon_stats], [1, 2, 3])
+        trade = next(item for item in result.trades if item.code == "000001")
+        self.assertEqual([item["return_pct"] for item in trade.daily_returns], [10.0, 20.0, -10.0])
+        self.assertEqual(result.horizon_stats[1]["average_return_pct"], 5.0)
+
+    def test_indicator_cache_is_reused_across_runs(self) -> None:
+        strategy = _AlwaysSelectStrategy()
+        original_prepare = strategy.prepare_all
+        prepare_calls = 0
+
+        def counted_prepare(data, config, context=None):
+            nonlocal prepare_calls
+            prepare_calls += 1
+            return original_prepare(data, config, context)
+
+        strategy.prepare_all = counted_prepare
+        request = BacktestRequest(
+            strategy_id="fake", start_date="2026-01-05", end_date="2026-01-05",
+            holding_days=2, holding_periods=[1, 2],
+            config={"global": {"adjust": "qfq", "top_m": 0, "n_turnover_days": 2, "markets": ["main"]}, "strategies": {"fake": {}}},
+        )
+        with patch("backtest.service.get_strategy", return_value=strategy), patch("backtest.service._strategy_signature", return_value="test-signature"):
+            first = run_backtest("cache-first", request)
+            backtest_cache.clear_memory_cache()
+            second = run_backtest("cache-second", request)
+
+        self.assertEqual(prepare_calls, 1)
+        self.assertEqual(first.meta["indicator_cache"]["source"], "created")
+        self.assertEqual(second.meta["indicator_cache"]["source"], "disk")
+        self.assertEqual(first.horizon_stats, second.horizon_stats)
 
     def test_weekly_indicator_does_not_change_when_future_prices_change(self) -> None:
         dates = pd.bdate_range("2026-01-05", periods=40)

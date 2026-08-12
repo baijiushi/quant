@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import inspect
 import threading
 from collections import defaultdict
 from datetime import datetime
@@ -11,11 +13,12 @@ from typing import Any, Callable, Dict
 import numpy as np
 import pandas as pd
 
+from backtest.cache import build_cache_key, load_prepared_cache, save_prepared_cache
 from backtest.schemas import BacktestRequest, BacktestResult, BacktestTrade
 from pipeline.cancellation import raise_if_cancelled
 from pipeline.pipeline_core import build_top_turnover_pool
 from pipeline.select_stock import filter_data_by_markets, load_stock_names, normalize_strategy_config
-from storage.database import list_trade_dates, load_daily_prices
+from storage.database import daily_price_fingerprint, list_trade_dates, load_daily_prices
 from strategies.base import StrategyContext
 from strategies.registry import get_strategy
 
@@ -125,7 +128,8 @@ def _evaluate_trade(
     return trade
 
 
-def _build_statistics(trades: list[BacktestTrade], holding_days: int) -> tuple[dict, list[dict], list[dict]]:
+def _build_statistics(trades: list[BacktestTrade], holding_periods: list[int]) -> tuple[dict, list[dict], list[dict]]:
+    holding_days = max(holding_periods)
     completed = [trade for trade in trades if trade.status == "completed" and trade.final_return_pct is not None]
     returns = [float(trade.final_return_pct) for trade in completed]
     wins = [value for value in returns if value > 0]
@@ -155,7 +159,7 @@ def _build_statistics(trades: list[BacktestTrade], holding_days: int) -> tuple[d
     }
 
     horizon_stats: list[dict] = []
-    for day_no in range(1, holding_days + 1):
+    for day_no in holding_periods:
         values = [
             float(item["return_pct"])
             for trade in trades
@@ -169,6 +173,8 @@ def _build_statistics(trades: list[BacktestTrade], holding_days: int) -> tuple[d
                 "win_rate_pct": _rounded(sum(value > 0 for value in values) / len(values) * 100) if values else None,
                 "average_return_pct": _rounded(float(np.mean(values))) if values else None,
                 "median_return_pct": _rounded(float(np.median(values))) if values else None,
+                "best_return_pct": _rounded(max(values)) if values else None,
+                "worst_return_pct": _rounded(min(values)) if values else None,
             }
         )
 
@@ -195,6 +201,31 @@ def _build_statistics(trades: list[BacktestTrade], holding_days: int) -> tuple[d
     return metrics, horizon_stats, stock_ranking
 
 
+def _strategy_signature(strategy: Any) -> str:
+    source_path = inspect.getsourcefile(strategy.__class__)
+    if not source_path:
+        return strategy.__class__.__qualname__
+    try:
+        return hashlib.sha256(Path(source_path).read_bytes()).hexdigest()[:16]
+    except OSError:
+        return strategy.__class__.__qualname__
+
+
+def _compact_prepared_cache(
+    strategy: Any,
+    strategy_cfg: dict,
+    prepared: dict[str, pd.DataFrame],
+) -> dict[str, pd.DataFrame]:
+    if not hasattr(strategy, "cache_columns"):
+        return prepared
+    requested_columns = set(strategy.cache_columns(strategy_cfg))
+    compact: dict[str, pd.DataFrame] = {}
+    for code, frame in prepared.items():
+        columns = [column for column in frame.columns if column in requested_columns]
+        compact[code] = frame.loc[:, columns].copy()
+    return compact
+
+
 def run_backtest(
     backtest_id: str,
     request: BacktestRequest,
@@ -205,6 +236,10 @@ def run_backtest(
     strategy = get_strategy(request.strategy_id)
     global_cfg = cfg.get("global", {})
     strategy_cfg = cfg.get("strategies", {}).get(request.strategy_id, {})
+    holding_periods = request.resolved_holding_periods()
+    if not holding_periods or holding_periods[0] < 1 or holding_periods[-1] > 60:
+        raise ValueError("持有周期必须在 1 至 60 个交易日之间")
+    max_holding_days = max(holding_periods)
     adjust = str(global_cfg.get("adjust", "qfq"))
     top_m = int(global_cfg.get("top_m", 3000))
     turnover_days = int(global_cfg.get("n_turnover_days", 43))
@@ -225,7 +260,7 @@ def run_backtest(
 
     warmup_bars = max(strategy.warmup_bars(strategy_cfg), turnover_days) + 5
     load_start_index = max(0, signal_indexes[0] - warmup_bars)
-    load_end_index = min(len(market_dates) - 1, signal_indexes[-1] + request.holding_days)
+    load_end_index = min(len(market_dates) - 1, signal_indexes[-1] + max_holding_days)
     load_start = str(market_dates[load_start_index].date())
     load_end = str(market_dates[load_end_index].date())
     if progress:
@@ -237,6 +272,28 @@ def run_backtest(
         raise ValueError("数据库中没有符合板块条件的行情，请先更新本地数据")
 
     names = load_stock_names(str(global_cfg.get("stock_list_file", "data/stocklist.csv")))
+    indicator_data = {
+        code: frame.loc[frame.index <= requested_end].copy()
+        for code, frame in data.items()
+    }
+    indicator_config = (
+        strategy.indicator_config(strategy_cfg)
+        if hasattr(strategy, "indicator_config")
+        else strategy_cfg
+    )
+    cache_metadata = {
+        "strategy_id": request.strategy_id,
+        "strategy_signature": _strategy_signature(strategy),
+        "indicator_config": indicator_config,
+        "adjust": adjust,
+        "markets": sorted(markets),
+        "n_turnover_days": turnover_days,
+        "load_start": load_start,
+        "load_end": request.end_date,
+        "price_data": daily_price_fingerprint(adjust, load_start, request.end_date),
+    }
+    cache_key = build_cache_key(cache_metadata)
+    prepared, cache_source = load_prepared_cache(request.strategy_id, cache_key)
     prepare_context = StrategyContext(
         pick_date=market_dates[signal_indexes[0]],
         names=names,
@@ -248,9 +305,28 @@ def run_backtest(
             if progress else None
         ),
     )
-    if progress:
-        progress("指标预计算", f"一次性预计算 {len(data)} 只股票的 {strategy.meta.name} 指标", 0, len(signal_indexes))
-    prepared = strategy.prepare_all(data, strategy_cfg, prepare_context)
+    if prepared is not None:
+        source_label = "进程内存" if cache_source == "memory" else "磁盘"
+        message = f"命中{source_label}指标缓存，复用 {len(prepared)} 只股票的 {strategy.meta.name} 指标"
+        logger.info(message)
+        if progress:
+            progress("指标预计算", message, len(indicator_data), len(indicator_data))
+    else:
+        if progress:
+            progress("指标预计算", f"缓存未命中，开始预计算 {len(indicator_data)} 只股票的 {strategy.meta.name} 指标", 0, len(indicator_data))
+        prepared = strategy.prepare_all(indicator_data, strategy_cfg, prepare_context)
+        raise_if_cancelled(stop_event)
+        try:
+            cached_prepared = _compact_prepared_cache(strategy, strategy_cfg, prepared)
+            cache_path = save_prepared_cache(request.strategy_id, cache_key, cached_prepared, cache_metadata)
+            cache_source = "created"
+            message = f"指标预计算完成并写入缓存：{cache_path.name}"
+            logger.info(message)
+            if progress:
+                progress("指标预计算", message, len(indicator_data), len(indicator_data))
+        except Exception as exc:  # noqa: BLE001
+            cache_source = "save_failed"
+            logger.warning("指标缓存写入失败，本次回测继续执行：%s", exc)
     raise_if_cancelled(stop_event)
 
     trades: list[BacktestTrade] = []
@@ -275,7 +351,7 @@ def run_backtest(
             if frame is None or frame.empty:
                 continue
             day_trades.append(
-                _evaluate_trade(candidate, frame, market_dates, signal_index, request.holding_days, signal_rank)
+                _evaluate_trade(candidate, frame, market_dates, signal_index, max_holding_days, signal_rank)
             )
         trades.extend(day_trades)
         completed_returns = [
@@ -310,7 +386,7 @@ def run_backtest(
     )
     for rank, trade in enumerate(trades, 1):
         trade.rank = rank
-    metrics, horizon_stats, stock_ranking = _build_statistics(trades, request.holding_days)
+    metrics, horizon_stats, stock_ranking = _build_statistics(trades, holding_periods)
     metrics["signal_day_count"] = len(signal_indexes)
 
     return BacktestResult(
@@ -321,7 +397,8 @@ def run_backtest(
             "strategy_name": strategy.meta.name,
             "start_date": request.start_date,
             "end_date": request.end_date,
-            "holding_days": request.holding_days,
+            "holding_days": max_holding_days,
+            "holding_periods": holding_periods,
         },
         metrics=metrics,
         horizon_stats=horizon_stats,
@@ -335,6 +412,11 @@ def run_backtest(
             "n_turnover_days": turnover_days,
             "loaded_range": {"start": load_start, "end": load_end},
             "loaded_stocks": len(data),
+            "indicator_cache": {
+                "key": cache_key,
+                "source": cache_source,
+                "reused": cache_source in {"memory", "disk"},
+            },
             "assumptions": [
                 "信号使用选股日收盘前可见数据",
                 "下一市场交易日开盘价买入",
