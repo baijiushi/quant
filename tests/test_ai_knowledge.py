@@ -7,6 +7,8 @@ from pathlib import Path
 import storage.database as database
 from ai_scoring import knowledge
 from ai_scoring.service import (
+    _candidate_run_signature,
+    _candidate_scores_match_run,
     _compact_dimension_review,
     _clean_model_rationale,
     _normalize_candidate_scores,
@@ -62,6 +64,46 @@ class AIKnowledgeTests(unittest.TestCase):
 
 
 class DeterministicScoringTests(unittest.TestCase):
+    def test_candidate_score_batch_requires_matching_signature(self) -> None:
+        candidate_run = {
+            "pick_date": "2026-08-11",
+            "meta": {"strategy": "b1"},
+            "candidates": [
+                {
+                    "code": "000001",
+                    "date": "2026-08-11",
+                    "strategy": "b1",
+                    "close": 10.5,
+                    "score": 1.25,
+                }
+            ],
+        }
+        payload = {
+            "strategy_id": "b1",
+            "pick_date": "2026-08-11",
+            "candidate_signature": _candidate_run_signature(candidate_run),
+            "scores": [{"code": "000001"}],
+        }
+
+        self.assertTrue(_candidate_scores_match_run(payload, candidate_run, "b1"))
+
+        changed_run = {**candidate_run, "candidates": [{**candidate_run["candidates"][0], "close": 10.6}]}
+        self.assertFalse(_candidate_scores_match_run(payload, changed_run, "b1"))
+
+    def test_legacy_candidate_score_batch_is_treated_as_stale(self) -> None:
+        candidate_run = {
+            "pick_date": "2026-08-11",
+            "meta": {"strategy": "b1"},
+            "candidates": [{"code": "600001", "date": "2026-08-11", "strategy": "b1"}],
+        }
+        legacy_payload = {
+            "strategy_id": "b1",
+            "pick_date": "2026-08-11",
+            "scores": [{"code": "600001"}],
+        }
+
+        self.assertFalse(_candidate_scores_match_run(legacy_payload, candidate_run, "b1"))
+
     def test_valuation_position_score_rewards_nearness_to_three_year_low(self) -> None:
         self.assertEqual(_valuation_position_score(20), 100)
         self.assertEqual(_valuation_position_score(70), 50)

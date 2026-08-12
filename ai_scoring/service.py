@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import re
 from datetime import datetime, timedelta
@@ -185,6 +186,7 @@ def _load_candidate_run(strategy_id: str | None = None) -> dict[str, Any]:
         path = ROOT / "data" / "candidates" / f"candidates_latest_{strategy_id}.json"
         if path.exists():
             return _read_json(path)
+        return {}
     return _read_json(LATEST_CANDIDATES)
 
 
@@ -201,16 +203,89 @@ def _load_stocklist_rows(limit_codes: set[str]) -> list[dict[str, str]]:
     return rows
 
 
+def _candidate_run_signature(candidate_run: dict[str, Any]) -> str:
+    """Build a stable identity for one strategy result batch."""
+    candidates = []
+    for item in candidate_run.get("candidates", []) or []:
+        candidates.append(
+            {
+                "code": str(item.get("code", "")).zfill(6),
+                "date": str(item.get("date", "")),
+                "strategy": str(item.get("strategy", "")),
+                "close": round(_number(item.get("close")), 6),
+                "score": round(_number(item.get("score")), 8),
+            }
+        )
+    identity = {
+        "strategy_id": str(candidate_run.get("meta", {}).get("strategy") or ""),
+        "pick_date": str(candidate_run.get("pick_date") or ""),
+        "candidates": candidates,
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _candidate_scores_match_run(
+    payload: dict[str, Any],
+    candidate_run: dict[str, Any],
+    strategy_id: str | None = None,
+) -> bool:
+    if not payload or not candidate_run:
+        return False
+    run_strategy = str(candidate_run.get("meta", {}).get("strategy") or strategy_id or "")
+    payload_strategy = str(payload.get("strategy_id") or "")
+    if strategy_id and payload_strategy != strategy_id:
+        return False
+    if run_strategy and payload_strategy != run_strategy:
+        return False
+    if str(payload.get("pick_date") or "") != str(candidate_run.get("pick_date") or ""):
+        return False
+
+    signature = str(payload.get("candidate_signature") or "")
+    if signature:
+        return signature == _candidate_run_signature(candidate_run)
+
+    # Records created before batch signatures existed are deliberately stale.
+    # Re-scoring once is safer than attaching an ambiguous historical result.
+    return False
+
+
+def _empty_candidate_scores(
+    candidate_run: dict[str, Any],
+    strategy_id: str | None,
+    stale_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    has_candidates = bool(candidate_run.get("candidates"))
+    return {
+        "generated_at": None,
+        "pick_date": candidate_run.get("pick_date"),
+        "strategy_id": strategy_id or candidate_run.get("meta", {}).get("strategy"),
+        "candidate_signature": _candidate_run_signature(candidate_run) if has_candidates else None,
+        "candidate_count": len(candidate_run.get("candidates", []) or []),
+        "status": "stale" if stale_payload else "not_scored",
+        "stale_generated_at": stale_payload.get("generated_at") if stale_payload else None,
+        "scores": [],
+    }
+
+
 def latest_candidate_ai_scores(strategy_id: str | None = None) -> dict[str, Any]:
+    candidate_run = _load_candidate_run(strategy_id)
     stored = db_latest_candidate_scores(strategy_id)
-    if stored:
+    if stored and _candidate_scores_match_run(stored, candidate_run, strategy_id):
+        stored["status"] = "current"
         return stored
     out_dir = _resolve(_read_yaml().get("scoring", {}).get("candidate_output_dir", "data/ai_scoring"))
+    file_payload: dict[str, Any] = {}
     if strategy_id:
         path = out_dir / f"candidate_ai_scores_latest_{strategy_id}.json"
         if path.exists():
-            return _read_json(path)
-    return _read_json(out_dir / "candidate_ai_scores_latest.json")
+            file_payload = _read_json(path)
+    else:
+        file_payload = _read_json(out_dir / "candidate_ai_scores_latest.json")
+    if file_payload and _candidate_scores_match_run(file_payload, candidate_run, strategy_id):
+        file_payload["status"] = "current"
+        return file_payload
+    return _empty_candidate_scores(candidate_run, strategy_id, stored or file_payload or None)
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -442,7 +517,8 @@ def score_latest_candidates(
     out_dir = _resolve(scoring_cfg.get("candidate_output_dir", "data/ai_scoring"))
     max_items = int(max_candidates or scoring_cfg.get("max_candidates_per_run", 20))
     candidate_run = _load_candidate_run(strategy_id)
-    candidates = list(candidate_run.get("candidates", []))[:max_items]
+    all_candidates = list(candidate_run.get("candidates", []))
+    candidates = all_candidates[:max_items]
     if not candidates:
         raise ValueError("当前策略没有可评分候选，请先完成选股任务。")
     sector_scores = latest_sector_scores()
@@ -508,6 +584,9 @@ def score_latest_candidates(
     payload["generated_at"] = datetime.now().isoformat(timespec="seconds")
     payload["pick_date"] = candidate_run.get("pick_date")
     payload["strategy_id"] = strategy_id or candidate_run.get("meta", {}).get("strategy") or "unknown"
+    payload["candidate_signature"] = _candidate_run_signature(candidate_run)
+    payload["candidate_count"] = len(all_candidates)
+    payload["status"] = "current"
     payload["methodology"] = METHODOLOGY_VERSION
     payload["model"] = stream_meta.get("model") or client.model
     payload["thinking_mode"] = True
