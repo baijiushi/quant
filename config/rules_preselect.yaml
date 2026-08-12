@@ -1,4 +1,4 @@
-active_strategy: volume_new_high
+active_strategy: high_52w_momentum
 global:
   data_dir: data/raw
   stock_list_file: data/stocklist.csv
@@ -15,7 +15,7 @@ strategies:
   b1:
     enabled: true
     kdj_period: 9
-    j_threshold: 20
+    j_threshold: 0
     zx_m1: 14
     zx_m2: 28
     zx_m3: 57
@@ -39,3 +39,15 @@ strategies:
     volume_ma_window: 20
     max_volume_ratio: 0.9
     min_score: 0
+  high_52w_momentum:
+    enabled: true
+    high_lookback_days: 252
+    momentum_lookback_days: 126
+    momentum_skip_days: 20
+    trend_ma_days: 60
+    min_high_proximity: 0.9
+    min_momentum_return: 0
+    require_above_trend_ma: true
+    high_proximity_weight: 0.6
+    momentum_weight: 0.4
+    max_candidates: 30

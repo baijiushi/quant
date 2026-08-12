@@ -85,6 +85,24 @@ class B1Strategy:
         volume_win = int(cfg.get("volume_ma_window", 20))
         return max(m4 + wma_l * 5, macd_slow + macd_signal, volume_win) + 30
 
+    def indicator_config(self, cfg: dict) -> dict:
+        cfg = self._cfg(cfg)
+        keys = {
+            "kdj_period", "zx_m1", "zx_m2", "zx_m3", "zx_m4",
+            "require_weekly_ma_bull", "wma_short", "wma_mid", "wma_long",
+            "require_macd_bull", "macd_fast", "macd_slow", "macd_signal",
+            "require_volume_ratio", "volume_ma_window",
+        }
+        return {key: cfg[key] for key in sorted(keys)}
+
+    def cache_columns(self, cfg: dict) -> set[str]:
+        return {
+            "close", "turnover_n", "K", "D", "J",
+            "ma14", "ma28", "ma57", "ma114",
+            "wma_short", "wma_mid", "wma_long",
+            "macd_dif", "macd_dea", "macd_hist", "volume_ratio",
+        }
+
     def prepare_all(
         self,
         data: Dict[str, pd.DataFrame],

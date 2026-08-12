@@ -136,7 +136,7 @@ def main() -> None:
     parser.add_argument(
         "--strategy-id",
         default=None,
-        help="策略 ID：b1 或 volume_new_high；默认读取配置 active_strategy",
+        help="策略 ID：b1、volume_new_high 或 high_52w_momentum；默认读取配置 active_strategy",
     )
     args = parser.parse_args()
 

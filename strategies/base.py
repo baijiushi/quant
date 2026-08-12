@@ -34,6 +34,12 @@ class BaseStrategy(Protocol):
     def warmup_bars(self, cfg: dict) -> int:
         ...
 
+    def indicator_config(self, cfg: dict) -> dict:
+        ...
+
+    def cache_columns(self, cfg: dict) -> set[str]:
+        ...
+
     def prepare_all(
         self,
         data: Dict[str, pd.DataFrame],

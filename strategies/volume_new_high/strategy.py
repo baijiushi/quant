@@ -67,6 +67,17 @@ class VolumeNewHighStrategy:
             int(cfg["volume_ma_window"]),
         ) + 5
 
+    def indicator_config(self, cfg: dict) -> dict:
+        cfg = self._cfg(cfg)
+        keys = {"corr_window", "stddev_window", "new_high_window", "volume_ma_window"}
+        return {key: cfg[key] for key in sorted(keys)}
+
+    def cache_columns(self, cfg: dict) -> set[str]:
+        return {
+            "close", "turnover_n", "high_volume_corr", "high_stddev",
+            "rolling_high", "is_new_high", "volume_ma", "volume_ratio",
+        }
+
     def prepare_all(
         self,
         data: Dict[str, pd.DataFrame],
