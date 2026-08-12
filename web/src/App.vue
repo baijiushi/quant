@@ -1,6 +1,12 @@
 <script setup lang="ts">
-import * as echarts from "echarts";
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { Button as TButton, DatePicker as TDatePicker, Drawer as TDrawer } from "tdesign-vue-next";
+import { ChartIcon, CloseIcon, FileIcon, PlayIcon, RobotIcon, SettingIcon, TaskIcon } from "tdesign-icons-vue-next";
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import CandidateTable from "./components/CandidateTable.vue";
+import MarketBreadthPanel from "./components/MarketBreadthPanel.vue";
+import RunStatusPanel from "./components/RunStatusPanel.vue";
+
+const KlineChart = defineAsyncComponent(() => import("./components/KlineChart.vue"));
 
 type DataMode = "existing" | "incremental" | "refresh" | "cache-only";
 type Market = "main" | "gem" | "star" | "bse";
@@ -67,23 +73,74 @@ interface KlineRow {
   amount?: number;
 }
 
-interface HistoricalEntrySignal {
-  signal_date: string;
-  entry_price: number;
-  stop_price: number;
-  target_price: number;
-  planned_reward_risk: number;
-  risk_pct_of_entry: number;
-  target_return_pct: number;
-  outcome: "target" | "stopped" | "ambiguous" | "open" | "invalid";
-  outcome_label: string;
-  exit_date?: string | null;
-  realized_r?: number | null;
+interface MarketBreadthComponent {
+  id: string;
+  name: string;
+  value_pct: number;
+  signal: string;
+  description: string;
+}
+
+interface MarketBreadth {
+  available: boolean;
+  trade_date?: string | null;
+  status: string;
+  risk_level: string;
+  score?: number | null;
+  position_guidance: string;
+  summary: string;
+  stock_count?: number;
+  components: MarketBreadthComponent[];
+  methodology?: string;
+  disclaimer?: string;
 }
 
 interface EntryPlan {
+  code: string;
+  name: string;
+  as_of: string;
+  mode: "a_share_daily_proxy";
+  framework: string;
+  trend: {
+    direction: "bullish" | "bearish" | "neutral";
+    status: string;
+    basis?: string;
+    bos_date?: string;
+    structure_price?: number | null;
+    close?: number | null;
+    atr?: number | null;
+  };
+  interception?: {
+    source: string;
+    status: string;
+    zone_low: number;
+    zone_high: number;
+    touched_recently: boolean;
+    reclaimed: boolean;
+  } | null;
+  entry: {
+    action: "ready" | "wait_confirmation" | "wait_interception" | "avoid_or_reduce" | "skip";
+    status: string;
+    confirmation?: string;
+    trigger_price?: number | null;
+    stop_price?: number | null;
+    target_1r?: number | null;
+    target_2r?: number | null;
+    selected_reward_risk?: number;
+    selected_target?: number | null;
+  };
+  position?: {
+    account_value: number;
+    risk_pct: number;
+    risk_budget: number;
+    risk_per_share: number;
+    suggested_shares: number;
+    position_value: number;
+    planned_loss: number;
+  } | null;
   historical_review: {
     window_bars: number;
+    requested_window_bars: number;
     start_date: string;
     end_date: string;
     signal_count: number;
@@ -91,9 +148,31 @@ interface EntryPlan {
     win_count: number;
     loss_count: number;
     win_rate: number | null;
-    signals: HistoricalEntrySignal[];
+    completed_profit_loss_ratio: number | null;
+    methodology: string;
+    signals: Array<{
+      signal_date: string;
+      entry_price: number;
+      stop_price: number;
+      target_price: number;
+      planned_reward_risk: number;
+      risk_pct_of_entry: number;
+      target_return_pct: number;
+      zone_low?: number | null;
+      zone_high?: number | null;
+      bos_date?: string | null;
+      outcome: "target" | "stopped" | "ambiguous" | "open" | "invalid";
+      outcome_label: string;
+      exit_date?: string | null;
+      realized_r?: number | null;
+    }>;
   };
-  smt: { status: string; reason: string };
+  smt: {
+    status: string;
+    available: boolean;
+    reason: string;
+    required_data: string[];
+  };
   warnings: string[];
 }
 
@@ -180,13 +259,17 @@ const pickDate = ref("");
 const runStatus = ref<RunStatus | null>(null);
 const latest = ref<CandidateRun | null>(null);
 const failures = ref<Record<string, unknown> | null>(null);
+const marketBreadth = ref<MarketBreadth | null>(null);
+const marketBreadthLoading = ref(false);
+const marketBreadthError = ref("");
 const selectedCode = ref("");
 const klineRows = ref<KlineRow[]>([]);
 const entryPlan = ref<EntryPlan | null>(null);
 const entryPlanLoading = ref(false);
 const entryPlanError = ref("");
+const entryAccountValue = ref(100000);
+const entryRiskPct = ref(0.5);
 const entryRewardRisk = ref(1);
-const chartEl = ref<HTMLDivElement | null>(null);
 const loading = ref(false);
 const message = ref("");
 const bootLoading = ref(true);
@@ -204,8 +287,11 @@ const researchTitle = ref("");
 const researchContent = ref("");
 const researchUrl = ref("");
 const researchSaving = ref(false);
+const parameterTab = ref<"basic" | "strategy" | "universe">("basic");
+const workspaceTab = ref<"run" | "ai" | "research" | "entry">("run");
+const configDrawerOpen = ref(false);
+const chartPanelEl = ref<HTMLElement | null>(null);
 let pollTimer: number | null = null;
-let chartResizeObserver: ResizeObserver | null = null;
 let aiEventSource: EventSource | null = null;
 let entryPlanRequest = 0;
 
@@ -248,6 +334,23 @@ const fallbackStrategies: StrategyInfo[] = [
       max_volume_ratio: 0.85,
       min_score: 0
     }
+  },
+  {
+    id: "high_52w_momentum",
+    name: "52周新高动量",
+    description: "寻找接近过去 52 周高点且中期动量为正的股票，并使用截面排名评分。",
+    default_config: {
+      high_lookback_days: 252,
+      momentum_lookback_days: 126,
+      momentum_skip_days: 20,
+      trend_ma_days: 60,
+      min_high_proximity: 0.9,
+      min_momentum_return: 0,
+      require_above_trend_ma: true,
+      high_proximity_weight: 0.6,
+      momentum_weight: 0.4,
+      max_candidates: 30
+    }
   }
 ];
 
@@ -259,8 +362,21 @@ const runLogs = computed(() => runStatus.value?.logs ?? []);
 const activeStrategy = computed(() => config.value?.active_strategy ?? "b1");
 const activeStrategyInfo = computed(() => strategies.value.find((item) => item.id === activeStrategy.value));
 const sectorScoreRows = computed(() => (aiSectorScores.value?.sectors ?? []) as SectorAIScore[]);
-const candidateScoreRows = computed(() => (aiCandidateScores.value?.scores ?? []) as CandidateAIScore[]);
+const candidateScoreRows = computed(() => {
+  const currentCodes = new Set(candidates.value.map((item) => item.code));
+  return ((aiCandidateScores.value?.scores ?? []) as CandidateAIScore[]).filter((item) =>
+    currentCodes.has(String(item.code).padStart(6, "0"))
+  );
+});
 const aiJobRunning = computed(() => ["queued", "running"].includes(aiScoreJob.value?.status ?? ""));
+const candidateScoreEmptyMessage = computed(() => {
+  if (aiJobRunning.value) return "正在生成当前候选的详细评分...";
+  if (!candidates.value.length) return "当前没有候选股票，请先运行选股策略。";
+  if (aiCandidateScores.value?.status === "stale") {
+    return "候选批次已经变化，上一批历史评分已隐藏；请点击“评分当前候选”。";
+  }
+  return "当前候选尚未进行 AI 评分。";
+});
 const displayedReasoning = computed(() => {
   const live = aiScoreJob.value?.reasoning;
   return live || String(aiCandidateScores.value?.reasoning_content ?? "");
@@ -283,6 +399,12 @@ const runProgress = computed(() => {
   if (stage.includes("更新") || stage.includes("数据")) return 20;
   return isRunning.value ? 8 : 0;
 });
+const dataModeLabel = computed(() => ({
+  existing: "本地数据",
+  incremental: "增量更新",
+  refresh: "重新拉取",
+  "cache-only": "仅缓存"
+} as Record<DataMode, string>)[config.value?.data_mode ?? "existing"]);
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -331,12 +453,16 @@ async function loadLatest() {
     const strategy = config.value?.active_strategy;
     const suffix = strategy ? `?strategy_id=${encodeURIComponent(strategy)}` : "";
     latest.value = await api<CandidateRun>(`/api/candidates/latest${suffix}`);
-    if (!selectedCode.value && candidates.value.length) {
-      selectedCode.value = candidates.value[0].code;
-    }
+    const availableCodes = new Set(candidates.value.map((item) => item.code));
+    if (!availableCodes.has(selectedCode.value)) selectedCode.value = candidates.value[0]?.code ?? "";
   } catch {
     latest.value = null;
   }
+}
+
+async function refreshLatest() {
+  await loadLatest();
+  await loadAiScores();
 }
 
 async function loadFailures() {
@@ -353,6 +479,32 @@ async function loadFailures() {
   }
 }
 
+async function loadMarketBreadth() {
+  if (!config.value) return;
+  marketBreadthLoading.value = true;
+  marketBreadthError.value = "";
+  try {
+    const params = new URLSearchParams({
+      adjust: String(config.value.global.adjust ?? "qfq"),
+      markets: (config.value.global.markets ?? ["main", "gem", "star", "bse"]).join(",")
+    });
+    if (pickDate.value) params.set("as_of", pickDate.value);
+    marketBreadth.value = await api<MarketBreadth>(`/api/market/breadth?${params.toString()}`);
+  } catch (error) {
+    marketBreadth.value = null;
+    marketBreadthError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    marketBreadthLoading.value = false;
+  }
+}
+
+async function openCandidateChart(item: Candidate) {
+  selectedCode.value = item.code;
+  workspaceTab.value = "entry";
+  await nextTick();
+  chartPanelEl.value?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
 async function loadAiScores() {
   const strategy = config.value?.active_strategy;
   const suffix = strategy ? `?strategy_id=${encodeURIComponent(strategy)}` : "";
@@ -366,6 +518,14 @@ async function loadAiScores() {
   } catch {
     aiCandidateScores.value = { generated_at: null, scores: [] };
   }
+}
+
+async function handleStrategyChange() {
+  selectedCode.value = "";
+  aiScoreJob.value = null;
+  aiCandidateScores.value = { generated_at: null, status: "not_scored", scores: [] };
+  closeAiEvents();
+  await Promise.all([loadLatest(), loadAiScores()]);
 }
 
 async function loadAiModel() {
@@ -530,6 +690,11 @@ function clearDisplayedResults() {
   failures.value = null;
   selectedCode.value = "";
   klineRows.value = [];
+  entryPlan.value = null;
+  entryPlanError.value = "";
+  aiCandidateScores.value = { generated_at: null, status: "not_scored", scores: [] };
+  aiScoreJob.value = null;
+  closeAiEvents();
 }
 
 async function saveConfig() {
@@ -548,6 +713,7 @@ async function saveConfig() {
 
 async function startRun() {
   if (!config.value) return;
+  configDrawerOpen.value = false;
   clearPollTimer();
   loading.value = true;
   message.value = "";
@@ -609,7 +775,8 @@ async function refreshRunStatus(runId: string): Promise<boolean> {
       clearPollTimer();
       await loadFailures();
       if (runStatus.value.status === "success") {
-        await loadLatest();
+        await Promise.all([loadLatest(), loadMarketBreadth()]);
+        await loadAiScores();
       }
       message.value =
         runStatus.value.status === "success"
@@ -678,6 +845,8 @@ async function loadEntryPlan(code: string) {
   const requestId = ++entryPlanRequest;
   if (!code) {
     entryPlan.value = null;
+    entryPlanLoading.value = false;
+    entryPlanError.value = "";
     return;
   }
   entryPlanLoading.value = true;
@@ -685,6 +854,8 @@ async function loadEntryPlan(code: string) {
   try {
     const params = new URLSearchParams({
       adjust: config.value?.global.adjust ?? "qfq",
+      account_value: String(entryAccountValue.value),
+      risk_pct: String(entryRiskPct.value),
       reward_risk: String(entryRewardRisk.value),
       review_bars: "60"
     });
@@ -707,124 +878,26 @@ function planPrice(value: number | null | undefined): string {
   return Number.isFinite(numeric) ? numeric.toFixed(2) : "-";
 }
 
-function finiteChartPrice(value: unknown): number | null {
+function planMoney(value: number | null | undefined): string {
   const numeric = Number(value);
-  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+  return Number.isFinite(numeric) ? numeric.toLocaleString("zh-CN", { maximumFractionDigits: 2 }) : "-";
 }
 
-function renderChart() {
-  if (!chartEl.value || !klineRows.value.length) return;
-  const chart = echarts.getInstanceByDom(chartEl.value) ?? echarts.init(chartEl.value);
-  const dates = klineRows.value.map((row) => row.date);
-  const candle = klineRows.value.map((row) => [row.open, row.close, row.low, row.high]);
-  const volumeWanShou = klineRows.value.map((row) => (row.volume ?? 0) / 10000);
-  const amountYi = klineRows.value.map((row) => (row.amount ?? 0) / 100000);
-  const historySignals = entryPlan.value?.historical_review.signals ?? [];
-  const reviewStart = entryPlan.value?.historical_review.start_date;
-  const reviewStartIndex = reviewStart ? dates.indexOf(reviewStart) : -1;
-  const reviewStartPercent = reviewStartIndex >= 0 && dates.length > 1
-    ? Math.max(0, reviewStartIndex / (dates.length - 1) * 100)
-    : 45;
-  const markPointData: Array<Record<string, unknown>> = [];
-
-  historySignals.forEach((signal, index) => {
-    const entryPrice = finiteChartPrice(signal.entry_price);
-    if (entryPrice === null || !dates.includes(signal.signal_date)) return;
-    const color = signal.outcome === "target"
-      ? "#00897b"
-      : signal.outcome === "stopped" ? "#c62828" : "#1565c0";
-    markPointData.push({
-      name: `历史入场点 ${index + 1}`,
-      coord: [signal.signal_date, entryPrice],
-      value: entryPrice,
-      symbol: "pin",
-      symbolSize: 58,
-      itemStyle: { color, borderColor: "#ffffff", borderWidth: 2 },
-      label: { color: "#ffffff", fontSize: 9, fontWeight: 800, formatter: `历史入场\n${entryPrice.toFixed(2)}` }
-    });
-  });
-  chart.resize();
-  chart.setOption({
-    animation: false,
-    tooltip: {
-      trigger: "axis",
-      axisPointer: { type: "cross" },
-      formatter(params: unknown) {
-        const items = Array.isArray(params) ? params : [params];
-        const first = items[0] as { dataIndex?: number; axisValue?: string } | undefined;
-        const index = first?.dataIndex ?? 0;
-        const row = klineRows.value[index];
-        if (!row) return "";
-        return [
-          `<strong>${first?.axisValue ?? row.date}</strong>`,
-          `开盘价：${Number(row.open).toFixed(2)}`,
-          `收盘价：${Number(row.close).toFixed(2)}`,
-          `最低价：${Number(row.low).toFixed(2)}`,
-          `最高价：${Number(row.high).toFixed(2)}`,
-          `成交量：${volumeWanShou[index].toFixed(2)} 万手`,
-          `成交额：${amountYi[index].toFixed(2)} 亿元`
-        ].join("<br/>");
-      }
-    },
-    grid: [
-      { left: 56, right: 28, top: 28, height: 280 },
-      { left: 56, right: 28, top: 340, height: 90 }
-    ],
-    xAxis: [
-      { type: "category", data: dates, boundaryGap: true, axisLine: { lineStyle: { color: "#607d8b" } } },
-      { type: "category", data: dates, gridIndex: 1, axisLabel: { show: false } }
-    ],
-    yAxis: [
-      {
-        name: "价格",
-        scale: true,
-        axisLine: { lineStyle: { color: "#607d8b" } },
-        splitLine: { lineStyle: { color: "#e0e0e0" } }
-      },
-      {
-        name: "成交量(万手)",
-        scale: true,
-        gridIndex: 1,
-        splitLine: { show: false },
-        axisLabel: {
-          formatter(value: number) {
-            return value.toFixed(0);
-          }
-        }
-      }
-    ],
-    dataZoom: [
-      { type: "inside", xAxisIndex: [0, 1], start: reviewStartPercent, end: 100 },
-      { show: true, xAxisIndex: [0, 1], start: reviewStartPercent, end: 100, bottom: 8, height: 20 }
-    ],
-    series: [
-      {
-        name: "K线",
-        type: "candlestick",
-        data: candle,
-        itemStyle: {
-          color: "#c94f3d",
-          color0: "#208c71",
-          borderColor: "#c94f3d",
-          borderColor0: "#208c71"
-        },
-        markPoint: { silent: true, animation: false, data: markPointData }
-      },
-      {
-        name: "成交量",
-        type: "bar",
-        xAxisIndex: 1,
-        yAxisIndex: 1,
-        data: volumeWanShou,
-        itemStyle: { color: "#607d8b" }
-      }
-    ]
-  });
+function trendLabel(value: EntryPlan["trend"]["direction"] | undefined): string {
+  if (value === "bullish") return "多头结构";
+  if (value === "bearish") return "空头结构";
+  return "结构不清晰";
 }
 
-function resizeChart() {
-  if (!chartEl.value) return;
-  echarts.getInstanceByDom(chartEl.value)?.resize();
+function entryActionLabel(value: EntryPlan["entry"]["action"] | undefined): string {
+  const labels: Record<string, string> = {
+    ready: "出现日线确认",
+    wait_confirmation: "等待低周期确认",
+    wait_interception: "等待回到截取区",
+    avoid_or_reduce: "回避或降低仓位",
+    skip: "跳过"
+  };
+  return labels[value ?? ""] ?? "未计算";
 }
 
 function toggleMarket(value: Market) {
@@ -836,38 +909,6 @@ function toggleMarket(value: Market) {
     markets.add(value);
   }
   config.value.global.markets = Array.from(markets);
-}
-
-function marketLabel(value: unknown): string {
-  const found = marketOptions.find((item) => item.value === value);
-  return found?.label ?? String(value ?? "-");
-}
-
-function strategyName(value: unknown): string {
-  const found = strategies.value.find((item) => item.id === value);
-  return found?.name ?? String(value ?? "-");
-}
-
-function extraNumber(item: Candidate, key: string): number {
-  const value = Number(item.extra?.[key] ?? 0);
-  return Number.isFinite(value) ? value : 0;
-}
-
-function factorLabel(): string {
-  return activeStrategy.value === "volume_new_high" ? "相关系数" : "J";
-}
-
-function factorValue(item: Candidate): string {
-  if (item.strategy === "volume_new_high") {
-    return extraNumber(item, "high_volume_corr").toFixed(3);
-  }
-  return extraNumber(item, "J").toFixed(1);
-}
-
-function turnoverYi(value: unknown): string {
-  const numeric = Number(value ?? 0);
-  if (!Number.isFinite(numeric)) return "0.00";
-  return (numeric / 100000).toFixed(2);
 }
 
 function aiListText(value: unknown): string {
@@ -900,10 +941,6 @@ function decisionLabel(value: unknown): string {
   return String(value ?? "-");
 }
 
-function statusLabel(value: RunStatus["status"] | undefined): string {
-  return ({ queued: "排队中", running: "运行中", cancelling: "正在终止", success: "已完成", failed: "运行失败", cancelled: "已终止" } as Record<string, string>)[value ?? ""] ?? "空闲";
-}
-
 function sourceCountLabel(item: CandidateAIScore): string {
   const refs = item.source_refs;
   return Array.isArray(refs) ? `${refs.length} 条证据` : refs ? "有证据" : "待补充";
@@ -912,19 +949,9 @@ function sourceCountLabel(item: CandidateAIScore): string {
 watch(selectedCode, async (code) => {
   if (code) {
     await Promise.all([loadKline(code), loadEntryPlan(code)]);
-    await nextTick();
-    renderChart();
+  } else {
+    entryPlan.value = null;
   }
-});
-
-watch(klineRows, async () => {
-  await nextTick();
-  renderChart();
-});
-
-watch(entryPlan, async () => {
-  await nextTick();
-  renderChart();
 });
 
 watch(displayedReasoning, async () => {
@@ -943,6 +970,7 @@ onMounted(async () => {
       await loadLatest();
     }
     await loadFailures();
+    await loadMarketBreadth();
     if (selectedCode.value) {
       await Promise.all([loadKline(selectedCode.value), loadEntryPlan(selectedCode.value)]);
     }
@@ -954,41 +982,43 @@ onMounted(async () => {
     bootError.value = error instanceof Error ? error.message : String(error);
   } finally {
     bootLoading.value = false;
-    await nextTick();
-    if (chartEl.value) {
-      chartResizeObserver = new ResizeObserver(() => resizeChart());
-      chartResizeObserver.observe(chartEl.value);
-    }
-    window.addEventListener("resize", resizeChart);
   }
 });
 
 onUnmounted(() => {
   clearPollTimer();
   closeAiEvents();
-  chartResizeObserver?.disconnect();
-  chartResizeObserver = null;
-  window.removeEventListener("resize", resizeChart);
 });
 </script>
 
 <template>
   <main class="shell">
-    <section class="hero">
-      <div>
-        <p class="eyebrow">oversell local console</p>
+    <section class="command-header">
+      <div class="command-copy">
         <h1>多策略量化选股控制台</h1>
+        <p>配置策略、监控数据任务，并从候选直接进入图表研究。</p>
       </div>
-      <div class="hero-stats">
-        <span>候选 {{ candidates.length }}</span>
-        <span>模式 {{ config?.data_mode ?? "-" }}</span>
-        <span>策略 {{ activeStrategyInfo?.name ?? activeStrategy }}</span>
-        <span>日期 {{ latest?.pick_date ?? "-" }}</span>
-        <span>存储 SQLite</span>
+      <div class="command-facts" aria-label="当前运行摘要">
+        <div><span>策略</span><strong>{{ activeStrategyInfo?.name ?? activeStrategy }}</strong></div>
+        <div><span>数据</span><strong>{{ dataModeLabel }}</strong></div>
+        <div><span>交易日</span><strong>{{ latest?.pick_date ?? "最新" }}</strong></div>
+        <div><span>候选</span><strong>{{ candidates.length }} 只</strong></div>
+      </div>
+      <div class="command-actions">
+        <TButton variant="outline" theme="default" @click="configDrawerOpen = true">
+          <template #icon><SettingIcon /></template>
+          运行参数
+        </TButton>
+        <TButton theme="primary" :loading="loading" :disabled="loading || isRunning || !config" @click="startRun">
+          <template #icon><PlayIcon /></template>
+          {{ isRunning ? "运行中" : "开始运行" }}
+        </TButton>
       </div>
     </section>
 
-    <section v-if="bootLoading" class="panel boot-panel">
+    <p v-if="message" class="system-notice" role="status">{{ message }}</p>
+
+    <section v-if="bootLoading && !config" class="panel boot-panel">
       正在加载控制台配置，请稍候...
     </section>
 
@@ -1001,15 +1031,49 @@ onUnmounted(() => {
     </section>
 
     <section v-if="config" class="layout">
-      <aside class="panel controls">
+      <TDrawer
+        v-model:visible="configDrawerOpen"
+        class="config-drawer"
+        header="运行参数"
+        placement="right"
+        size="min(580px, 100vw)"
+        :footer="false"
+      >
+      <aside class="controls drawer-controls">
         <div class="panel-title">
-          <h2>运行参数</h2>
-          <button :disabled="loading" @click="saveConfig">保存</button>
+          <div>
+            <h2>策略与数据设置</h2>
+            <p class="hint">修改后先保存；开始任务时会再次把当前配置交给后端。</p>
+          </div>
+          <div class="drawer-title-actions">
+            <button class="drawer-close-button" type="button" @click="configDrawerOpen = false">
+              <CloseIcon size="16px" />关闭
+            </button>
+            <button :disabled="loading" @click="saveConfig">保存配置</button>
+          </div>
         </div>
 
+        <nav class="parameter-tabs" aria-label="运行参数分类">
+          <button
+            v-for="tab in [
+              { id: 'basic', label: '基础' },
+              { id: 'strategy', label: '策略' },
+              { id: 'universe', label: '高级' }
+            ]"
+            :key="tab.id"
+            :class="{ active: parameterTab === tab.id }"
+            type="button"
+            :aria-selected="parameterTab === tab.id"
+            @click="parameterTab = tab.id as typeof parameterTab"
+          >
+            {{ tab.label }}
+          </button>
+        </nav>
+
+        <div v-show="parameterTab === 'basic'" class="parameter-tab-panel">
         <label class="field">
           <span>选股策略</span>
-          <select v-model="config.active_strategy" @change="loadLatest">
+          <select v-model="config.active_strategy" @change="handleStrategyChange">
             <option v-for="item in strategies" :key="item.id" :value="item.id">
               {{ item.name }}
             </option>
@@ -1027,10 +1091,20 @@ onUnmounted(() => {
           </select>
           <small class="hint">调参数反复试策略时建议用“直接使用本地数据”，避免每次先更新行情。</small>
         </label>
+        <div v-if="config.data_mode === 'incremental' || config.data_mode === 'refresh'" class="data-mode-warning">
+          <strong>{{ config.data_mode === "refresh" ? "完整重拉会持续较长时间" : "增量更新需要先访问 TUShare" }}</strong>
+          <span>如果这次只想调整参数并重新筛选，请改用“直接使用本地数据”。任务启动后也可以在监控栏安全终止。</span>
+        </div>
 
         <label class="field">
           <span>选股日期</span>
-          <input v-model="pickDate" type="date" />
+          <TDatePicker
+            v-model="pickDate"
+            clearable
+            format="YYYY-MM-DD"
+            value-type="YYYY-MM-DD"
+            placeholder="选择交易日（默认最新）"
+          />
           <small class="hint">留空表示使用本地缓存中的最新交易日；指定日期会按 YYYY-MM-DD 传给后端。</small>
         </label>
 
@@ -1048,7 +1122,12 @@ onUnmounted(() => {
             </button>
           </div>
         </div>
+        </div>
 
+        <div v-show="parameterTab === 'universe'" class="parameter-tab-panel">
+          <div class="strategy-note">
+            这里控制选股范围和流动性预筛。首次调试建议保留默认值；Top M 越小，运行越快，但可能漏掉成交较弱的股票。
+          </div>
         <div class="grid-2">
           <label class="field">
             <span>流动性 Top M（按成交额）</span>
@@ -1061,7 +1140,9 @@ onUnmounted(() => {
             <small class="hint">用于计算滚动成交额，越大越偏长期流动性。示例：20、43、60。</small>
           </label>
         </div>
+        </div>
 
+        <div v-show="parameterTab === 'strategy'" class="parameter-tab-panel">
         <template v-if="config.active_strategy === 'b1'">
           <div class="section-title">B1：KDJ / 均线</div>
           <div class="strategy-note">
@@ -1198,100 +1279,126 @@ onUnmounted(() => {
           </div>
         </template>
 
+        <template v-if="config.active_strategy === 'high_52w_momentum'">
+          <div class="section-title">52周新高动量</div>
+          <div class="strategy-note">
+            寻找仍靠近一年高点、且过去约半年保持正动量的股票。评分由“接近高点排名”和
+            “中期动量排名”合成，建议先保留趋势过滤并通过回测检查参数稳定性。
+          </div>
+          <div class="grid-2">
+            <label class="field">
+              <span>新高回看天数</span>
+              <input v-model.number="config.strategies.high_52w_momentum.high_lookback_days" type="number" min="120" max="400" />
+              <small class="hint">默认 252 个交易日，约等于 52 周。建议范围 200–300。</small>
+            </label>
+            <label class="field">
+              <span>动量回看天数</span>
+              <input v-model.number="config.strategies.high_52w_momentum.momentum_lookback_days" type="number" min="20" max="252" />
+              <small class="hint">默认 126 日，约半年；越长越偏中期趋势。</small>
+            </label>
+            <label class="field">
+              <span>跳过最近天数</span>
+              <input v-model.number="config.strategies.high_52w_momentum.momentum_skip_days" type="number" min="0" max="60" />
+              <small class="hint">默认跳过 20 日，减少短期反转影响；0 表示不跳过。</small>
+            </label>
+            <label class="field">
+              <span>趋势均线</span>
+              <input v-model.number="config.strategies.high_52w_momentum.trend_ma_days" type="number" min="10" max="250" />
+              <small class="hint">默认 MA60；趋势过滤启用时要求收盘价站在均线上方。</small>
+            </label>
+            <label class="field">
+              <span>最低高点接近度</span>
+              <input v-model.number="config.strategies.high_52w_momentum.min_high_proximity" type="number" min="0.5" max="1" step="0.01" />
+              <small class="hint">0.90 表示收盘价距离 52 周最高价不超过约 10%。</small>
+            </label>
+            <label class="field">
+              <span>最低动量收益</span>
+              <input v-model.number="config.strategies.high_52w_momentum.min_momentum_return" type="number" min="-1" max="5" step="0.05" />
+              <small class="hint">小数形式；0 表示中期收益为正，0.10 表示至少上涨 10%。</small>
+            </label>
+            <label class="field">
+              <span>高点权重</span>
+              <input v-model.number="config.strategies.high_52w_momentum.high_proximity_weight" type="number" min="0" max="1" step="0.1" />
+              <small class="hint">默认 0.6，系统会和动量权重自动归一化。</small>
+            </label>
+            <label class="field">
+              <span>动量权重</span>
+              <input v-model.number="config.strategies.high_52w_momentum.momentum_weight" type="number" min="0" max="1" step="0.1" />
+              <small class="hint">默认 0.4；提高后更偏向过去涨幅领先的股票。</small>
+            </label>
+            <label class="field">
+              <span>最多候选数</span>
+              <input v-model.number="config.strategies.high_52w_momentum.max_candidates" type="number" min="0" max="500" />
+              <small class="hint">默认 30；设为 0 表示返回全部符合条件的股票。</small>
+            </label>
+          </div>
+          <label class="switch">
+            <input v-model="config.strategies.high_52w_momentum.require_above_trend_ma" type="checkbox" />
+            <span>要求站上趋势均线</span>
+          </label>
+        </template>
+        </div>
+
         <button class="run-button" :disabled="loading || isRunning" @click="startRun">
-          {{ isRunning ? "运行中" : "开始运行" }}
+          {{ isRunning ? "任务正在运行" : "保存当前参数并运行" }}
         </button>
-        <p v-if="message" class="message">{{ message }}</p>
       </aside>
+      </TDrawer>
 
       <section class="main-stack">
-        <div class="panel status">
-        <div class="panel-title">
-          <h2>任务状态</h2>
-          <div class="status-actions">
-            <span class="stage-badge">{{ runStatus?.stage ?? "空闲" }}</span>
-            <button
-              v-if="runStatus && isRunning"
-              class="danger-button"
-              :disabled="loading || isCancelling"
-              @click="stopRun"
-            >
-              {{ isCancelling ? "终止中" : "终止任务" }}
-            </button>
-          </div>
-        </div>
-          <div v-if="runStatus" class="status-row">
-            <strong>状态：{{ statusLabel(runStatus.status) }}</strong>
-            <span>任务：{{ runStatus.run_id }}</span>
-            <span>开始：{{ runStatus.started_at ?? "-" }}</span>
-            <span>结束：{{ runStatus.finished_at ?? "-" }}</span>
-          </div>
-          <div v-if="runStatus" class="progress-wrap" :aria-label="`当前进度 ${runProgress}%`">
-            <div class="progress-meta"><span>{{ runStatus.stage }}</span><strong>{{ runProgress }}%</strong></div>
-            <div class="progress-track"><i :style="{ width: `${runProgress}%` }"></i></div>
-            <div class="run-steps">
-              <span :class="{ done: runProgress >= 20 }">数据</span>
-              <span :class="{ done: runProgress >= 38 }">加载</span>
-              <span :class="{ done: runProgress >= 58 }">流动性</span>
-              <span :class="{ done: runProgress >= 75 }">策略</span>
-              <span :class="{ done: runProgress >= 92 }">结果</span>
-            </div>
-          </div>
-          <pre v-if="runLogs.length" class="terminal">{{ runLogs.join("\n") }}</pre>
-          <p v-if="runStatus?.error" class="error">{{ runStatus.error }}</p>
-          <p v-if="!runStatus">尚未启动本轮任务。</p>
-        </div>
+        <nav class="workspace-tabs" aria-label="控制台工作区">
+          <button type="button" :class="{ active: workspaceTab === 'run' }" @click="workspaceTab = 'run'">
+            <TaskIcon size="18px" /><span>运行与候选</span><small>任务、结果和失败报告</small>
+          </button>
+          <button type="button" :class="{ active: workspaceTab === 'ai' }" @click="workspaceTab = 'ai'">
+            <RobotIcon size="18px" /><span>AI 评分</span><small>赛道和当前候选评分</small>
+          </button>
+          <button type="button" :class="{ active: workspaceTab === 'research' }" @click="workspaceTab = 'research'">
+            <FileIcon size="18px" /><span>研究素材</span><small>视频、动态和研报摘要</small>
+          </button>
+          <button type="button" :class="{ active: workspaceTab === 'entry' }" @click="workspaceTab = 'entry'">
+            <ChartIcon size="18px" /><span>进场与图表</span><small>趋势截取和 K 线计划</small>
+          </button>
+        </nav>
 
-        <div class="panel">
-          <div class="panel-title">
-            <h2>候选股票</h2>
-            <button :disabled="isRunning" @click="loadLatest">
-              {{ isRunning ? "运行中" : "刷新结果" }}
-            </button>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>代码</th>
-                  <th>名称</th>
-                  <th>收盘</th>
-                  <th>评分</th>
-                  <th>{{ factorLabel() }}</th>
-                  <th>滚动成交额(亿元)</th>
-                  <th>量比</th>
-                  <th>策略</th>
-                  <th>板块</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr
-                  v-for="item in candidates"
-                  :key="item.code"
-                  :class="{ selected: item.code === selectedCode }"
-                  @click="selectedCode = item.code"
-                >
-                  <td>{{ item.code }}</td>
-                  <td>{{ item.name }}</td>
-                  <td>{{ item.close?.toFixed(2) }}</td>
-                  <td>{{ item.score?.toFixed(4) }}</td>
-                  <td>{{ factorValue(item) }}</td>
-                  <td>{{ turnoverYi(item.turnover_n) }}</td>
-                  <td>{{ Number(item.extra?.volume_ratio ?? 0).toFixed(2) }}</td>
-                  <td>{{ strategyName(item.strategy) }}</td>
-                  <td>{{ marketLabel(item.extra?.market) }}</td>
-                </tr>
-                <tr v-if="!candidates.length">
-                  <td colspan="9" class="empty-cell">
-                    {{ isRunning ? "任务运行中，旧候选已清空，等待新结果..." : "暂无候选结果" }}
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
+        <section v-show="workspaceTab === 'run'" class="run-workspace">
+          <CandidateTable
+            :candidates="candidates"
+            :selected-code="selectedCode"
+            :running="isRunning"
+            :active-strategy="activeStrategy"
+            :strategies="strategies"
+            @refresh="refreshLatest"
+            @select="openCandidateChart"
+          />
+          <aside class="monitor-rail">
+            <RunStatusPanel
+              :status="runStatus"
+              :progress="runProgress"
+              :logs="runLogs"
+              :running="isRunning"
+              :cancelling="isCancelling"
+              :loading="loading"
+              @stop="stopRun"
+            />
+            <MarketBreadthPanel
+              :breadth="marketBreadth"
+              :loading="marketBreadthLoading"
+              :error="marketBreadthError"
+              @refresh="loadMarketBreadth"
+            />
+            <details class="failure-summary">
+              <summary>
+                <span>数据失败报告</span>
+                <strong>{{ Number(failures?.failed_count ?? 0) + Number(failures?.empty_count ?? 0) }} 项</strong>
+              </summary>
+              <p>失败 {{ failures?.failed_count ?? 0 }} 只，空数据 {{ failures?.empty_count ?? 0 }} 只。</p>
+              <pre>{{ JSON.stringify(failures, null, 2) }}</pre>
+            </details>
+          </aside>
+        </section>
 
-        <div class="panel ai-panel">
+        <div v-show="workspaceTab === 'ai'" class="panel ai-panel">
           <div class="panel-title">
             <div>
               <div class="ai-heading">
@@ -1338,11 +1445,17 @@ onUnmounted(() => {
           </section>
 
           <div class="ai-grid">
-            <section>
+            <section class="ai-score-section sector-score-section">
               <h3>赛道景气度</h3>
               <p class="hint">更新时间：{{ aiSectorScores?.generated_at ?? "-" }}</p>
-              <div class="mini-table">
+              <div class="mini-table sector-score-table">
                 <table>
+                  <colgroup>
+                    <col class="sector-name-column" />
+                    <col class="sector-score-column" />
+                    <col class="sector-type-column" />
+                    <col class="sector-catalyst-column" />
+                  </colgroup>
                   <thead>
                     <tr>
                       <th>赛道</th>
@@ -1366,10 +1479,10 @@ onUnmounted(() => {
               </div>
             </section>
 
-            <section>
+            <section class="ai-score-section candidate-score-section">
               <h3>候选股评分</h3>
               <p class="hint">更新时间：{{ aiCandidateScores?.generated_at ?? "-" }}</p>
-              <div class="mini-table">
+              <div class="mini-table candidate-score-table">
                 <table>
                   <thead>
                     <tr>
@@ -1395,7 +1508,7 @@ onUnmounted(() => {
                       <td class="rationale-cell">{{ item.rationale ?? aiListText(item.evidence_gaps) }}</td>
                     </tr>
                     <tr v-if="!candidateScoreRows.length">
-                      <td colspan="8" class="empty-cell">{{ aiJobRunning ? "正在生成详细评分..." : "暂无个股 AI 评分" }}</td>
+                      <td colspan="8" class="empty-cell">{{ candidateScoreEmptyMessage }}</td>
                     </tr>
                   </tbody>
                 </table>
@@ -1457,7 +1570,7 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <div class="panel research-panel">
+        <div v-show="workspaceTab === 'research'" class="panel research-panel">
           <div class="panel-title">
             <div>
               <h2>赛道研究素材库</h2>
@@ -1493,17 +1606,18 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <div class="panel entry-review-panel">
+        <div v-show="workspaceTab === 'entry'" class="panel entry-plan-panel">
           <div class="panel-title">
             <div>
-              <p class="entry-kicker">最近 60 个交易日历史复盘</p>
               <h2>趋势截取入场点检查</h2>
-              <p class="hint">逐日检查最近 60 根 K 线；历史点不是当前买入推荐。</p>
+              <p class="hint">
+                逐日检查最近 60 根 K 线是否出现过入场点，并评价其后续止盈止损；这些历史点不是当前买入推荐。
+              </p>
             </div>
             <span class="stage-badge">{{ entryPlan?.historical_review.signal_count ?? 0 }} 个历史入场点</span>
           </div>
 
-          <div class="entry-review-controls">
+          <div class="entry-plan-controls">
             <label class="field">
               <span>复盘目标盈亏比（R）</span>
               <input v-model.number="entryRewardRisk" type="number" min="0.5" max="5" step="0.5" />
@@ -1514,39 +1628,79 @@ onUnmounted(() => {
           </div>
 
           <p v-if="entryPlanLoading" class="empty-cell">正在逐日扫描最近 60 个交易日...</p>
-          <p v-else-if="entryPlanError" class="entry-review-error">{{ entryPlanError }}</p>
+          <p v-else-if="entryPlanError" class="entry-plan-error">{{ entryPlanError }}</p>
+          <p v-else-if="!selectedCode" class="empty-cell">在候选股表中选择一只股票后查看计划。</p>
+
           <template v-else-if="entryPlan">
-            <div class="entry-review-summary">
-              <article><span>观察区间</span><strong>{{ entryPlan.historical_review.window_bars }} 日</strong><small>{{ entryPlan.historical_review.start_date }} 至 {{ entryPlan.historical_review.end_date }}</small></article>
-              <article><span>历史入场点</span><strong>{{ entryPlan.historical_review.signal_count }} 个</strong><small>已结束 {{ entryPlan.historical_review.completed_count }} 个</small></article>
-              <article><span>历史结果</span><strong>{{ entryPlan.historical_review.win_count }} 胜 / {{ entryPlan.historical_review.loss_count }} 负</strong><small>胜率 {{ entryPlan.historical_review.win_rate === null ? "样本不足" : `${(entryPlan.historical_review.win_rate * 100).toFixed(1)}%` }}</small></article>
+            <div class="framework-strip">
+              <article class="framework-step">
+                <span>观察区间</span>
+                <strong>{{ entryPlan.historical_review.window_bars }} 个交易日</strong>
+                <p>{{ entryPlan.historical_review.start_date }} 至 {{ entryPlan.historical_review.end_date }}</p>
+                <small>每个日期只使用当日及以前的 K 线</small>
+              </article>
+              <article class="framework-step">
+                <span>历史入场点</span>
+                <strong>{{ entryPlan.historical_review.signal_count }} 个</strong>
+                <p>已结束 {{ entryPlan.historical_review.completed_count }} 个</p>
+                <small>相邻连续确认只记录首次出现</small>
+              </article>
+              <article class="framework-step">
+                <span>历史结果</span>
+                <strong>{{ entryPlan.historical_review.win_count }} 胜 / {{ entryPlan.historical_review.loss_count }} 负</strong>
+                <p>胜率 {{ entryPlan.historical_review.win_rate === null ? "样本不足" : `${(entryPlan.historical_review.win_rate * 100).toFixed(1)}%` }}</p>
+                <small>同日触及止盈止损不计胜负</small>
+              </article>
             </div>
-            <div v-if="entryPlan.historical_review.signals.length" class="entry-review-list">
+
+            <div v-if="entryPlan.historical_review.signals.length" class="research-list">
               <article v-for="signal in entryPlan.historical_review.signals" :key="signal.signal_date">
                 <div><strong>{{ signal.signal_date }} 历史入场</strong><span>{{ signal.outcome_label }}</span></div>
-                <p>入场 {{ planPrice(signal.entry_price) }} · 止损 {{ planPrice(signal.stop_price) }} · {{ signal.planned_reward_risk }}R 目标 {{ planPrice(signal.target_price) }}</p>
-                <small>下行风险 {{ signal.risk_pct_of_entry.toFixed(2) }}% · 目标涨幅 {{ signal.target_return_pct.toFixed(2) }}%{{ signal.exit_date ? ` · 结果日期 ${signal.exit_date}` : " · 观察期内未结束" }}</small>
+                <p>
+                  入场 {{ planPrice(signal.entry_price) }} · 止损 {{ planPrice(signal.stop_price) }} ·
+                  {{ signal.planned_reward_risk }}R 目标 {{ planPrice(signal.target_price) }}
+                </p>
+                <small>
+                  下行风险 {{ signal.risk_pct_of_entry.toFixed(2) }}% · 目标涨幅 {{ signal.target_return_pct.toFixed(2) }}% ·
+                  {{ signal.exit_date ? `结果日期 ${signal.exit_date}` : "观察期内未结束" }}
+                  {{ signal.realized_r === null || signal.realized_r === undefined ? "" : ` · ${signal.realized_r}R` }}
+                </small>
               </article>
             </div>
             <p v-else class="empty-cell">最近 60 个交易日没有发现符合当前日线代理规则的入场点。</p>
-            <div class="smt-boundary"><strong>SMT：{{ entryPlan.smt.status }}</strong><p>{{ entryPlan.smt.reason }}</p></div>
-            <ul class="entry-warnings"><li v-for="warning in entryPlan.warnings" :key="warning">{{ warning }}</li></ul>
+
+            <div class="smt-boundary">
+              <div>
+                <strong>SMT：{{ entryPlan.smt.status }}</strong>
+                <p>{{ entryPlan.smt.reason }}</p>
+              </div>
+              <a href="https://www.bilibili.com/video/BV1boVK6vEHY/" target="_blank" rel="noreferrer">查看作者模块二</a>
+            </div>
+            <ul class="entry-warnings">
+              <li v-for="warning in entryPlan.warnings" :key="warning">{{ warning }}</li>
+            </ul>
           </template>
         </div>
 
-        <div class="panel chart-panel">
-          <h2>{{ selectedCandidate?.name ?? "单股图表" }} {{ selectedCode }}</h2>
-          <p class="hint">图钉标在历史信号实际出现的交易日：绿色达到目标，红色止损，蓝色尚未结束或结果不明确。</p>
-          <div ref="chartEl" class="chart"></div>
+        <div ref="chartPanelEl" v-show="workspaceTab === 'entry'" class="panel chart-panel">
+          <div class="chart-panel-heading">
+            <div>
+              <h2>{{ selectedCandidate?.name ?? "单股图表" }} {{ selectedCode }}</h2>
+              <p class="hint">图钉标在历史信号实际出现的交易日；绿色达到目标，红色止损，蓝色尚未结束或结果不明确。</p>
+            </div>
+            <div v-if="entryPlan?.historical_review.signal_count" class="chart-plan-legend" aria-label="历史入场点图例">
+              <span class="entry-line">历史入场点</span>
+            </div>
+          </div>
+          <KlineChart
+            :rows="klineRows"
+            :history-signals="entryPlan?.historical_review.signals ?? []"
+            :review-start="entryPlan?.historical_review.start_date ?? ''"
+            :stock-label="selectedCandidate?.name ?? selectedCode"
+            :active="workspaceTab === 'entry'"
+          />
         </div>
 
-        <div class="panel failures">
-          <h2>失败报告</h2>
-          <p>
-            失败 {{ failures?.failed_count ?? 0 }} 只，空数据 {{ failures?.empty_count ?? 0 }} 只。
-          </p>
-          <pre>{{ JSON.stringify(failures, null, 2) }}</pre>
-        </div>
       </section>
     </section>
   </main>

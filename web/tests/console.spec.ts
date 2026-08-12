@@ -4,19 +4,92 @@ test("console page renders candidates and chart controls", async ({ page }) => {
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "多策略量化选股控制台" })).toBeVisible();
-  await expect(page.getByText("运行参数")).toBeVisible();
+  await expect(page.getByRole("button", { name: "运行参数" })).toBeVisible();
   await expect(page.getByText("任务状态")).toBeVisible();
-  await expect(page.getByText("候选股票")).toBeVisible();
-  await expect(page.getByText("DeepSeek AI 评分")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "市场宽度与风险状态" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "候选股票" })).toBeVisible();
+  await expect(page.getByText("DeepSeek AI 评分")).toBeHidden();
 
+  await page.getByRole("button", { name: "运行参数" }).click();
   await expect(page.getByLabel("选股策略")).toBeVisible();
   await page.getByLabel("数据模式").selectOption("existing");
   await expect(page.getByRole("button", { name: "开始运行" })).toBeEnabled();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("heading", { name: "策略与数据设置" })).toBeHidden();
 
   const rows = page.locator("tbody tr").filter({ has: page.locator("td") });
   await expect(rows.first()).toBeVisible();
   await expect(page.getByText("滚动成交额(亿元)")).toBeVisible();
-  await expect(page.locator(".chart")).toBeVisible();
+  const candidateTableBox = await page.locator(".candidate-table-wrap").boundingBox();
+  expect(candidateTableBox).not.toBeNull();
+  expect(candidateTableBox?.height ?? 0).toBeGreaterThanOrEqual(620);
+  const workspaceTabs = page.locator(".workspace-tabs");
+  const tabButtons = workspaceTabs.getByRole("button");
+  const runTab = tabButtons.filter({ hasText: "运行与候选" });
+  const aiTab = tabButtons.filter({ hasText: "AI 评分" });
+  const entryTab = tabButtons.filter({ hasText: "进场与图表" });
+  const initialNavHeight = (await workspaceTabs.boundingBox())?.height ?? 0;
+  const initialTabHeights = await tabButtons.evaluateAll((items) => items.map((item) => item.getBoundingClientRect().height));
+  expect(new Set(initialTabHeights).size).toBe(1);
+
+  await aiTab.click();
+  await expect(page.getByText("DeepSeek AI 评分")).toBeVisible();
+  const sectorScoreSection = page.locator(".sector-score-section");
+  const candidateScoreSection = page.locator(".candidate-score-section");
+  const sectorScoreBox = await sectorScoreSection.boundingBox();
+  const candidateScoreBox = await candidateScoreSection.boundingBox();
+  expect(sectorScoreBox).not.toBeNull();
+  expect(candidateScoreBox).not.toBeNull();
+  expect(candidateScoreBox?.y ?? 0).toBeGreaterThan(
+    (sectorScoreBox?.y ?? 0) + (sectorScoreBox?.height ?? 0)
+  );
+  const sectorTableFits = await page.locator(".sector-score-table").evaluate(
+    (table) => table.scrollWidth <= table.clientWidth + 1
+  );
+  expect(sectorTableFits).toBeTruthy();
+  const aiNavHeight = (await workspaceTabs.boundingBox())?.height ?? 0;
+  expect(Math.abs(aiNavHeight - initialNavHeight)).toBeLessThan(1);
+
+  await runTab.click();
+  const firstCode = await rows.first().locator("td").first().innerText();
+  await rows.first().click();
+  await expect(entryTab).toHaveClass(/active/);
+  await expect(page.locator(".chart-panel h2")).toContainText(firstCode);
+  const chart = page.locator(".chart");
+  await expect(chart).toBeVisible();
+  await expect(chart.locator("canvas")).toBeVisible();
+  const chartBox = await chart.boundingBox();
+  expect(chartBox).not.toBeNull();
+  expect(chartBox?.height ?? 0).toBeGreaterThanOrEqual(575);
+
+  await chart.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    element.dispatchEvent(new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      clientX: rect.left + rect.width * 0.5,
+      clientY: rect.top + rect.height * 0.35,
+      deltaY: -120,
+      shiftKey: true
+    }));
+  });
+  await expect(page.locator(".chart-range-label")).not.toHaveText("纵轴自动");
+  await page.getByRole("button", { name: "恢复纵轴" }).click();
+  await expect(page.locator(".chart-range-label")).toHaveText("纵轴自动");
+
+  await chart.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    element.dispatchEvent(new WheelEvent("wheel", {
+      bubbles: true,
+      cancelable: true,
+      clientX: rect.left + 30,
+      clientY: rect.top + rect.height * 0.35,
+      deltaY: 120
+    }));
+  });
+  await expect(page.locator(".chart-range-label")).not.toHaveText("纵轴自动");
+  await chart.dblclick();
+  await expect(page.locator(".chart-range-label")).toHaveText("纵轴自动");
 });
 
 test("console restores active run after reopening the page", async ({ page }) => {
@@ -50,12 +123,28 @@ test("console restores active run after reopening the page", async ({ page }) =>
 test("console switches to volume new-high strategy parameters", async ({ page }) => {
   await page.goto("/");
 
+  await page.getByRole("button", { name: "运行参数" }).click();
   await page.getByLabel("选股策略").selectOption("volume_new_high");
+  await page.getByRole("button", { name: "策略", exact: true }).click();
   await expect(page.getByText("缩量新高 / 波动率过滤")).toBeVisible();
   await expect(page.getByLabel("相关系数窗口")).toBeVisible();
   await expect(page.getByLabel("波动率窗口")).toBeVisible();
   await expect(page.getByLabel("最大量比")).toBeVisible();
   await expect(page.getByRole("columnheader", { name: "相关系数" })).toBeVisible();
+});
+
+test("console exposes 52-week-high momentum parameters", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "运行参数" }).click();
+  const strategySelect = page.getByLabel("选股策略");
+  await strategySelect.selectOption("high_52w_momentum");
+  await expect(strategySelect).toHaveValue("high_52w_momentum");
+  await page.getByRole("button", { name: "策略", exact: true }).click();
+  await expect(page.getByLabel("新高回看天数")).toBeVisible();
+  await expect(page.getByLabel("动量回看天数")).toBeVisible();
+  await expect(page.getByLabel("最低高点接近度")).toHaveValue("0.9");
+  await expect(page.getByRole("columnheader", { name: "距52周高点" })).toBeVisible();
 });
 
 test("console can request run cancellation", async ({ page }) => {
@@ -101,6 +190,7 @@ test("console can request run cancellation", async ({ page }) => {
 test("console can save and delete a research evidence note", async ({ page }) => {
   await page.goto("/");
 
+  await page.getByRole("button", { name: /研究素材/ }).click();
   await page.getByLabel("素材标题").fill("浏览器回归测试素材");
   await page.getByLabel("研究摘要与原始要点").fill("这是自动化测试素材，会在本测试结束前删除。");
   await page.getByRole("button", { name: "保存研究素材" }).click();
@@ -119,6 +209,7 @@ test("backtest route runs a daily replay and shows ranked returns", async ({ pag
     start_date: "2026-07-01",
     end_date: "2026-07-10",
     holding_days: 3,
+    holding_periods: [3],
     status: "running",
     stage: "逐日选股",
     progress: 64,
@@ -141,7 +232,7 @@ test("backtest route runs a daily replay and shows ranked returns", async ({ pag
   const result = {
     backtest_id: "backtest123",
     generated_at: "2026-07-11T10:00:08",
-    request: { strategy_id: "b1", strategy_name: "B1 战法", start_date: "2026-07-01", end_date: "2026-07-10", holding_days: 3 },
+    request: { strategy_id: "b1", strategy_name: "B1 战法", start_date: "2026-07-01", end_date: "2026-07-10", holding_days: 3, holding_periods: [3] },
     metrics: {
       signal_count: 2, completed_count: 2, win_count: 1, loss_count: 1,
       win_rate_pct: 50, average_return_pct: 4.25, median_return_pct: 4.25, profit_loss_ratio: 2.4
@@ -190,14 +281,25 @@ test("backtest route runs a daily replay and shows ranked returns", async ({ pag
     expect(route.request().method()).toBe("POST");
     const payload = route.request().postDataJSON();
     expect(payload.holding_days).toBe(3);
+    expect(payload.holding_periods).toEqual([3]);
     await route.fulfill({ json: running });
   });
 
   await page.goto("/backtest");
   await expect(page.getByRole("heading", { name: "逐日选股回测" })).toBeVisible();
+  const startBox = await page.getByLabel("开始日期").boundingBox();
+  const endBox = await page.getByLabel("结束日期").boundingBox();
+  expect(startBox).not.toBeNull();
+  expect(endBox).not.toBeNull();
+  expect((endBox?.y ?? 0)).toBeGreaterThan((startBox?.y ?? 0) + (startBox?.height ?? 0));
   await page.getByLabel("开始日期").fill("2026-07-01");
   await page.getByLabel("结束日期").fill("2026-07-10");
-  await page.getByLabel("持有交易日 X").fill("3");
+  const periodGroup = page.getByRole("group", { name: "选择持有交易日" });
+  for (const days of [5, 10, 15, 20]) {
+    const button = periodGroup.getByRole("button", { name: `D${days}`, exact: true });
+    if ((await button.getAttribute("aria-pressed")) === "true") await button.click();
+  }
+  await expect(periodGroup.getByRole("button", { name: "D3", exact: true })).toHaveAttribute("aria-pressed", "true");
   await page.getByRole("button", { name: "开始逐日回测" }).click();
 
   await expect(page.getByText("回测完成，共 2 条信号")).toBeVisible();

@@ -22,6 +22,7 @@ interface BacktestStatus {
   start_date: string;
   end_date: string;
   holding_days: number;
+  holding_periods: number[];
   status: "queued" | "running" | "cancelling" | "success" | "failed" | "cancelled";
   stage: string;
   progress: number;
@@ -64,7 +65,14 @@ interface BacktestTrade {
 interface BacktestResult {
   backtest_id: string;
   generated_at: string;
-  request: Record<string, any>;
+  request: {
+    strategy_id: string;
+    strategy_name?: string;
+    start_date: string;
+    end_date: string;
+    holding_days: number;
+    holding_periods?: number[];
+  };
   metrics: Record<string, number | null>;
   horizon_stats: Array<Record<string, number | null>>;
   daily_stats: Array<Record<string, any>>;
@@ -91,8 +99,9 @@ const form = reactive({
   strategy_id: "b1",
   start_date: "",
   end_date: "",
-  holding_days: 5,
+  holding_periods: [3, 5, 10, 15, 20] as number[],
 });
+const holdingPeriodOptions = [3, 5, 10, 15, 20];
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -116,8 +125,22 @@ const strategyConfig = computed<Record<string, any>>(() => {
 });
 const globalConfig = computed(() => config.value?.global || {});
 const isRunning = computed(() => ["queued", "running", "cancelling"].includes(status.value?.status || ""));
-const displayHoldingDays = computed(() => Number(result.value?.request.holding_days || form.holding_days));
-const holdingColumns = computed(() => Array.from({ length: displayHoldingDays.value }, (_, index) => index + 1));
+const displayHoldingPeriods = computed(() => {
+  const periods = result.value
+    ? result.value.request.holding_periods?.length
+      ? result.value.request.holding_periods
+      : [result.value.request.holding_days]
+    : form.holding_periods;
+  return [...new Set(periods.map(Number))].filter((value) => Number.isFinite(value)).sort((a, b) => a - b);
+});
+const maxHoldingDays = computed(() => Math.max(...displayHoldingPeriods.value, 1));
+const holdingColumns = computed(() => displayHoldingPeriods.value);
+const cacheLabel = computed(() => {
+  const cache = result.value?.meta?.indicator_cache;
+  if (!cache) return "";
+  if (cache.reused) return cache.source === "memory" ? "指标缓存：内存复用" : "指标缓存：磁盘复用";
+  return cache.source === "created" ? "指标缓存：本次已建立" : "指标缓存：未保存";
+});
 
 const filteredTrades = computed(() => {
   const needle = searchText.value.trim().toLowerCase();
@@ -155,6 +178,15 @@ function marketSelected(market: string) {
   return (globalConfig.value.markets || []).includes(market);
 }
 
+function toggleHoldingPeriod(days: number) {
+  if (form.holding_periods.includes(days)) {
+    if (form.holding_periods.length === 1) return;
+    form.holding_periods = form.holding_periods.filter((value) => value !== days);
+  } else {
+    form.holding_periods = [...form.holding_periods, days].sort((a, b) => a - b);
+  }
+}
+
 function parameterNumber(key: string, fallback = 0) {
   const value = Number(strategyConfig.value[key]);
   return Number.isFinite(value) ? value : fallback;
@@ -183,7 +215,9 @@ async function initialize() {
     form.strategy_id = current.backtest?.strategy_id || configPayload.active_strategy || strategyPayload.strategies[0]?.id || "b1";
     form.start_date = current.backtest?.start_date || meta.suggested_start_date || meta.first_date || "";
     form.end_date = current.backtest?.end_date || meta.latest_date || "";
-    form.holding_days = current.backtest?.holding_days || 5;
+    form.holding_periods = current.backtest?.holding_periods?.length
+      ? [...current.backtest.holding_periods]
+      : current.backtest?.holding_days ? [current.backtest.holding_days] : [3, 5, 10, 15, 20];
     status.value = current.backtest;
     if (current.backtest?.status === "success") await loadResult(current.backtest.backtest_id);
     if (current.backtest && ["queued", "running", "cancelling"].includes(current.backtest.status)) startPolling();
@@ -206,7 +240,8 @@ async function startBacktest() {
         strategy_id: form.strategy_id,
         start_date: form.start_date,
         end_date: form.end_date,
-        holding_days: form.holding_days,
+        holding_days: Math.max(...form.holding_periods),
+        holding_periods: form.holding_periods,
         config: config.value,
       }),
     });
@@ -338,7 +373,7 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
           <small class="hint">{{ strategy?.description }}</small>
         </label>
 
-        <div class="date-pair">
+        <div class="date-pair backtest-date-range">
           <label class="field">
             <span>开始日期</span>
             <input v-model="form.start_date" type="date" :disabled="isRunning" />
@@ -349,11 +384,21 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
           </label>
         </div>
 
-        <label class="field">
-          <span>持有交易日 X</span>
-          <input v-model.number="form.holding_days" type="number" min="1" max="60" :disabled="isRunning" />
-          <small class="hint">D1 是买入当天收盘收益，最终收益按第 X 个交易日收盘计算。</small>
-        </label>
+        <div class="field">
+          <span>持有交易日（可多选）</span>
+          <div class="holding-period-grid" role="group" aria-label="选择持有交易日">
+            <button
+              v-for="days in holdingPeriodOptions"
+              :key="days"
+              type="button"
+              :class="{ selected: form.holding_periods.includes(days) }"
+              :disabled="isRunning"
+              :aria-pressed="form.holding_periods.includes(days)"
+              @click="toggleHoldingPeriod(days)"
+            >D{{ days }}</button>
+          </div>
+          <small class="hint">同一轮信号同时计算所选周期，无需分别回测。收益均按次日开盘买入、第 D 日收盘卖出。</small>
+        </div>
 
         <p class="section-title">板块范围</p>
         <div class="market-grid">
@@ -392,7 +437,7 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
           <label class="switch-row"><input :checked="Boolean(strategyConfig.require_volume_ratio)" type="checkbox" :disabled="isRunning" @change="updateBoolean('require_volume_ratio', $event)" /><span>启用成交量过滤</span></label>
         </template>
 
-        <template v-else>
+        <template v-else-if="form.strategy_id === 'volume_new_high'">
           <p class="section-title">缩量新高参数</p>
           <div class="parameter-note">相关性越负越符合“价升量缩”；新高窗口越长，信号越稀缺。量比上限 0.85 表示成交量不高于均量的 85%。</div>
           <div class="date-pair">
@@ -401,6 +446,20 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
             <label class="field"><span>新高窗口</span><input :value="parameterNumber('new_high_window', 60)" type="number" min="10" max="500" :disabled="isRunning" @input="updateParameter('new_high_window', $event)" /></label>
             <label class="field"><span>最大量比</span><input :value="parameterNumber('max_volume_ratio', 0.85)" type="number" min="0.05" max="3" step="0.05" :disabled="isRunning" @input="updateParameter('max_volume_ratio', $event)" /></label>
           </div>
+        </template>
+
+        <template v-else-if="form.strategy_id === 'high_52w_momentum'">
+          <p class="section-title">52周新高动量参数</p>
+          <div class="parameter-note">接近度 0.90 表示距离一年高点不超过约 10%；默认跳过最近 20 日计算中期动量，以减少短期反转影响。</div>
+          <div class="date-pair">
+            <label class="field"><span>新高回看天数</span><input :value="parameterNumber('high_lookback_days', 252)" type="number" min="120" max="400" :disabled="isRunning" @input="updateParameter('high_lookback_days', $event)" /></label>
+            <label class="field"><span>动量回看天数</span><input :value="parameterNumber('momentum_lookback_days', 126)" type="number" min="20" max="252" :disabled="isRunning" @input="updateParameter('momentum_lookback_days', $event)" /></label>
+            <label class="field"><span>跳过最近天数</span><input :value="parameterNumber('momentum_skip_days', 20)" type="number" min="0" max="60" :disabled="isRunning" @input="updateParameter('momentum_skip_days', $event)" /></label>
+            <label class="field"><span>最低高点接近度</span><input :value="parameterNumber('min_high_proximity', 0.9)" type="number" min="0.5" max="1" step="0.01" :disabled="isRunning" @input="updateParameter('min_high_proximity', $event)" /></label>
+            <label class="field"><span>最低动量收益</span><input :value="parameterNumber('min_momentum_return', 0)" type="number" min="-1" max="5" step="0.05" :disabled="isRunning" @input="updateParameter('min_momentum_return', $event)" /></label>
+            <label class="field"><span>最多候选数</span><input :value="parameterNumber('max_candidates', 30)" type="number" min="0" max="500" :disabled="isRunning" @input="updateParameter('max_candidates', $event)" /></label>
+          </div>
+          <label class="switch-row"><input :checked="Boolean(strategyConfig.require_above_trend_ma)" type="checkbox" :disabled="isRunning" @change="updateBoolean('require_above_trend_ma', $event)" /><span>要求站上趋势均线</span></label>
         </template>
 
         <div class="assumption-card">
@@ -426,6 +485,7 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
             <span :class="['status-chip', status.status]">{{ statusLabel(status.status) }}</span>
             <span>{{ status.stage }}</span>
             <span v-if="status.total_days">{{ status.processed_days }}/{{ status.total_days }} 个交易日</span>
+            <span>D{{ (status.holding_periods?.length ? status.holding_periods : [status.holding_days]).join(' / D') }}</span>
             <span class="run-id">任务 {{ status.backtest_id }}</span>
           </div>
           <div v-if="status" class="progress-track"><div :style="{ width: `${status.progress}%` }"></div></div>
@@ -439,20 +499,20 @@ onBeforeUnmount(() => { if (pollTimer) window.clearInterval(pollTimer); });
 
         <template v-if="result">
           <section class="metric-grid">
-            <article class="metric-card accent"><span>胜率</span><strong>{{ formatPercent(result.metrics.win_rate_pct) }}</strong><small>{{ result.metrics.win_count }} 胜 / {{ result.metrics.loss_count }} 负</small></article>
-            <article class="metric-card"><span>平均收益</span><strong :class="returnClass(result.metrics.average_return_pct)">{{ formatPercent(result.metrics.average_return_pct) }}</strong><small>中位数 {{ formatPercent(result.metrics.median_return_pct) }}</small></article>
+            <article class="metric-card accent"><span>D{{ maxHoldingDays }} 胜率</span><strong>{{ formatPercent(result.metrics.win_rate_pct) }}</strong><small>{{ result.metrics.win_count }} 胜 / {{ result.metrics.loss_count }} 负</small></article>
+            <article class="metric-card"><span>D{{ maxHoldingDays }} 平均收益</span><strong :class="returnClass(result.metrics.average_return_pct)">{{ formatPercent(result.metrics.average_return_pct) }}</strong><small>中位数 {{ formatPercent(result.metrics.median_return_pct) }}</small></article>
             <article class="metric-card"><span>盈亏比</span><strong>{{ formatNumber(result.metrics.profit_loss_ratio) }}</strong><small>平均盈利 / 平均亏损</small></article>
             <article class="metric-card"><span>有效交易</span><strong>{{ result.metrics.completed_count }}</strong><small>共 {{ result.metrics.signal_count }} 条信号</small></article>
           </section>
 
           <article class="panel horizon-card">
-            <div class="panel-title"><div><p class="mini-label">HORIZON CURVE</p><h2>持有期表现</h2></div><span class="data-dot">D1 → D{{ displayHoldingDays }}</span></div>
+            <div class="panel-title"><div><p class="mini-label">HORIZON COMPARISON</p><h2>多持有周期对比</h2></div><span class="data-dot">{{ cacheLabel || `D${holdingColumns.join(' / D')}` }}</span></div>
             <div class="horizon-list">
               <div v-for="item in result.horizon_stats" :key="String(item.day)" class="horizon-item">
                 <strong>D{{ item.day }}</strong>
                 <div class="horizon-bar"><span :class="returnClass(item.average_return_pct)" :style="{ width: `${Math.min(100, Math.abs(Number(item.average_return_pct || 0)) * 8 + 4)}%` }"></span></div>
                 <b :class="returnClass(item.average_return_pct)">{{ formatPercent(item.average_return_pct) }}</b>
-                <small>胜率 {{ formatPercent(item.win_rate_pct) }} · {{ item.sample_count }} 笔</small>
+                <small>胜率 {{ formatPercent(item.win_rate_pct) }} · 中位 {{ formatPercent(item.median_return_pct) }} · {{ item.sample_count }} 笔</small>
               </div>
             </div>
           </article>
